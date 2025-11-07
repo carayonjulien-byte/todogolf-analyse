@@ -54,24 +54,39 @@ def warp_sheet(image, markers):
 
 
 def detect_red_points(warped):
+    # on passe en HSV
     hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-    lower_red = np.array([0, 120, 70])
-    upper_red = np.array([10, 255, 255])
-    mask = cv2.inRange(hsv, lower_red, upper_red)
 
-    # nettoyage
+    # il y a souvent 2 zones de rouge en HSV (0-10 et 170-180)
+    lower_red1 = np.array([0, 80, 50])
+    upper_red1 = np.array([10, 255, 255])
+
+    lower_red2 = np.array([170, 80, 50])
+    upper_red2 = np.array([180, 255, 255])
+
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    # petit nettoyage
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=1)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     points = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
-        if 20 < area < 2000:
+
+        # on élargit un peu la fourchette
+        if 10 < area < 5000:
             cx = x + w // 2
             cy = y + h // 2
             points.append((cx, cy))
+
     return points
 
 
@@ -135,3 +150,4 @@ async def analyse_image(file: UploadFile = File(...)):
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
