@@ -1,5 +1,4 @@
-fastapi
-uvicorn
+flask
+gunicorn
 opencv-python-headless
 numpy
-python-multipart
