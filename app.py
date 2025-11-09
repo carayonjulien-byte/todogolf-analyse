@@ -15,32 +15,33 @@ MAX_RED_AREA_FALLBACK = 5000
 # ---------- utils géométrie ----------
 def circle_from_3_points(p1, p2, p3):
     """
-    p1, p2, p3 = (x, y, area) ou (x, y)
-    Retourne (cx, cy, r) du cercle passant par ces 3 points.
-    Si les points sont trop alignés -> retourne None.
+    Retourne (cx, cy, r) du cercle passant par 3 points (x,y[,area]).
     """
     x1, y1 = p1[0], p1[1]
     x2, y2 = p2[0], p2[1]
     x3, y3 = p3[0], p3[1]
 
-    # calcul déterminant
     temp = x2**2 + y2**2
     bc = (x1**2 + y1**2 - temp) / 2.0
     cd = (temp - x3**2 - y3**2) / 2.0
     det = (x1 - x2) * (y2 - y3) - (x2 - x3) * (y1 - y2)
 
     if abs(det) < 1e-6:
-        return None  # quasi alignés
+        return None
 
-    # centre
     cx = (bc * (y2 - y3) - cd * (y1 - y2)) / det
     cy = ((x1 - x2) * cd - (x2 - x3) * bc) / det
-
     r = np.sqrt((cx - x1) ** 2 + (cy - y1) ** 2)
     return (int(cx), int(cy), int(r))
 
 
-# ---------- utils calib ----------
+def image_center(img):
+    """centre de l'image en px (secours si la calibration échoue)"""
+    h, w = img.shape[:2]
+    return (w // 2, h // 2)
+
+
+# ---------- utils calibration ----------
 def estimate_mm_per_px_from_calib(contour_area_px, calib_diameter_mm=CALIB_DOT_DIAMETER_MM):
     if contour_area_px == 0:
         return None
@@ -74,6 +75,7 @@ def find_red_points(bgr_image, mm_per_px=None, min_diameter_mm=2.0, max_diameter
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # plage d'aire attendue via la calibration
     if mm_per_px is not None:
         min_diam_px = mm_to_px(min_diameter_mm, mm_per_px)
         max_diam_px = mm_to_px(max_diameter_mm, mm_per_px)
@@ -199,7 +201,7 @@ def compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=
 # ---------- routes ----------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API (cercle à partir des 3 points) OK", 200
+    return "Radar ToDoGolf API (cercle 3 points + fix image_center) OK", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -246,7 +248,7 @@ def analyze():
             circle_center = (circle[0], circle[1])
             circle_radius = circle[2]
 
-    # échelle mètres (on garde celle depuis le bas)
+    # échelle mètres
     meters_per_px = None
     if calib_struct is not None:
         meters_per_px = compute_scale_from_bottom(
@@ -256,7 +258,7 @@ def analyze():
     if meters_per_px is None:
         meters_per_px = 0.1
 
-    # on garde que les coups dans le cercle
+    # on garde que les coups dans le vrai cercle
     if circle_radius is not None:
         shot_points = keep_points_in_circle(shot_points, circle_center, circle_radius)
 
