@@ -6,19 +6,41 @@ import numpy as np
 
 app = Flask(__name__)
 
-# -----------------------
-# PARAMÈTRES
-# -----------------------
 CALIB_STEP_METERS = 10.0
-CALIB_DOT_DIAMETER_MM = 3.0  # diamètre réel du rond noir imprimé
+CALIB_DOT_DIAMETER_MM = 3.0
 MIN_RED_AREA_FALLBACK = 100
 MAX_RED_AREA_FALLBACK = 5000
-RADAR_RADIUS_FACTOR = 0.8    # % de la distance centre -> rond du haut qu'on garde
 
 
-# =======================
-# UTILITAIRES
-# =======================
+# ---------- utils géométrie ----------
+def circle_from_3_points(p1, p2, p3):
+    """
+    p1, p2, p3 = (x, y, area) ou (x, y)
+    Retourne (cx, cy, r) du cercle passant par ces 3 points.
+    Si les points sont trop alignés -> retourne None.
+    """
+    x1, y1 = p1[0], p1[1]
+    x2, y2 = p2[0], p2[1]
+    x3, y3 = p3[0], p3[1]
+
+    # calcul déterminant
+    temp = x2**2 + y2**2
+    bc = (x1**2 + y1**2 - temp) / 2.0
+    cd = (temp - x3**2 - y3**2) / 2.0
+    det = (x1 - x2) * (y2 - y3) - (x2 - x3) * (y1 - y2)
+
+    if abs(det) < 1e-6:
+        return None  # quasi alignés
+
+    # centre
+    cx = (bc * (y2 - y3) - cd * (y1 - y2)) / det
+    cy = ((x1 - x2) * cd - (x2 - x3) * bc) / det
+
+    r = np.sqrt((cx - x1) ** 2 + (cy - y1) ** 2)
+    return (int(cx), int(cy), int(r))
+
+
+# ---------- utils calib ----------
 def estimate_mm_per_px_from_calib(contour_area_px, calib_diameter_mm=CALIB_DOT_DIAMETER_MM):
     if contour_area_px == 0:
         return None
@@ -33,20 +55,7 @@ def mm_to_px(mm_value, mm_per_px):
     return mm_value / mm_per_px
 
 
-def filter_points_in_circle(points, center, radius_px):
-    """points = [(x,y,area)], center=(cx,cy). Garde uniquement ceux dans le disque."""
-    cx, cy = center
-    kept = []
-    r2 = radius_px * radius_px
-    for (x, y, area) in points:
-        if (x - cx) ** 2 + (y - cy) ** 2 <= r2:
-            kept.append((x, y, area))
-    return kept
-
-
-# =======================
-# DÉTECTION POINTS ROUGES
-# =======================
+# ---------- détection rouge 2–4 mm ----------
 def find_red_points(bgr_image, mm_per_px=None, min_diameter_mm=2.0, max_diameter_mm=4.0):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
@@ -87,19 +96,15 @@ def find_red_points(bgr_image, mm_per_px=None, min_diameter_mm=2.0, max_diameter
         if ratio < 0.5 or ratio > 1.5:
             continue
 
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
+        # centre du rectangle pour être plus stable
+        cx = int(x + w / 2)
+        cy = int(y + h / 2)
         points.append((cx, cy, area_px))
 
     return points, mask
 
 
-# =======================
-# DÉTECTION RONDS NOIRS
-# =======================
+# ---------- détection 3 ronds noirs ----------
 def find_black_calibration_points(bgr_image):
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
@@ -154,14 +159,16 @@ def compute_scale_from_bottom(bottom_left, bottom_right):
     return CALIB_STEP_METERS / dist_px
 
 
-def image_center(img):
-    h, w = img.shape[:2]
-    return (w // 2, h // 2)
+def keep_points_in_circle(points, center, radius_px):
+    cx, cy = center
+    kept = []
+    for (x, y, area) in points:
+        if (x - cx) ** 2 + (y - cy) ** 2 <= radius_px ** 2:
+            kept.append((x, y, area))
+    return kept
 
 
-# =======================
-# CALCUL COUPS
-# =======================
+# ---------- calcul coups ----------
 def compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=None):
     results = []
     ox, oy = origin_px
@@ -189,12 +196,10 @@ def compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=
     return results
 
 
-# =======================
-# ROUTES
-# =======================
+# ---------- routes ----------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API (filtre 2-4mm + zone) OK", 200
+    return "Radar ToDoGolf API (cercle à partir des 3 points) OK", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -212,48 +217,55 @@ def analyze():
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
 
-    # 1) ronds noirs
+    # calibration
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
 
-    # mm/px
+    # mm/pixel
     mm_per_px = None
     if calib_points:
         mm_per_px = estimate_mm_per_px_from_calib(calib_points[0][2], calib_diameter_mm=CALIB_DOT_DIAMETER_MM)
 
-    # 2) points rouges
-    shot_points, _ = find_red_points(img, mm_per_px=mm_per_px, min_diameter_mm=2.0, max_diameter_mm=4.0)
+    # coups rouges
+    shot_points, _ = find_red_points(
+        img,
+        mm_per_px=mm_per_px,
+        min_diameter_mm=2.0,
+        max_diameter_mm=4.0,
+    )
 
-    # 3) origine + rayon de zone + échelle
-    meters_per_px = None
-    origin_px = image_center(img)
-    radar_radius_px = None
-
+    # centre + rayon via les 3 signes
+    circle_center = image_center(img)
+    circle_radius = None
     if calib_struct is not None:
+        top = calib_struct["top"]
         bl = calib_struct["bottom_left"]
         br = calib_struct["bottom_right"]
-        top = calib_struct["top"]
+        circle = circle_from_3_points(top, bl, br)
+        if circle is not None:
+            circle_center = (circle[0], circle[1])
+            circle_radius = circle[2]
 
-        # centre du radar
-        origin_px = (
-            int((bl[0] + br[0]) / 2),
-            int((bl[1] + br[1]) / 2),
+    # échelle mètres (on garde celle depuis le bas)
+    meters_per_px = None
+    if calib_struct is not None:
+        meters_per_px = compute_scale_from_bottom(
+            calib_struct["bottom_left"],
+            calib_struct["bottom_right"]
         )
-
-        # rayon du radar = distance centre -> rond du haut * facteur
-        dist_top = np.sqrt((top[0] - origin_px[0]) ** 2 + (top[1] - origin_px[1]) ** 2)
-        radar_radius_px = int(dist_top * RADAR_RADIUS_FACTOR)
-
-        meters_per_px = compute_scale_from_bottom(bl, br)
-
     if meters_per_px is None:
         meters_per_px = 0.1
 
-    # 4) filtrer les points rouges dans le cercle
-    if radar_radius_px is not None:
-        shot_points = filter_points_in_circle(shot_points, origin_px, radar_radius_px)
+    # on garde que les coups dans le cercle
+    if circle_radius is not None:
+        shot_points = keep_points_in_circle(shot_points, circle_center, circle_radius)
 
-    coups = compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=centre_distance)
+    coups = compute_shot_metrics(
+        shot_points,
+        circle_center,
+        meters_per_px,
+        centre_distance=centre_distance
+    )
 
     return jsonify({
         "club": club,
@@ -264,9 +276,8 @@ def analyze():
             "nb_points_calib": len(calib_points),
             "nb_points_rouges": len(shot_points),
             "meters_per_px": meters_per_px,
-            "mm_per_px": mm_per_px,
-            "origin_px": origin_px,
-            "radar_radius_px": radar_radius_px,
+            "origin_px": circle_center,
+            "radar_radius_px": circle_radius,
         }
     })
 
@@ -282,51 +293,53 @@ def mask_route():
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
-    # calib
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
 
     mm_per_px = None
-    origin_px = image_center(img)
-    radar_radius_px = None
-
     if calib_points:
         mm_per_px = estimate_mm_per_px_from_calib(calib_points[0][2], calib_diameter_mm=CALIB_DOT_DIAMETER_MM)
 
-    # rouges
-    shot_points, red_mask = find_red_points(img, mm_per_px=mm_per_px, min_diameter_mm=2.0, max_diameter_mm=4.0)
+    shot_points, red_mask = find_red_points(
+        img,
+        mm_per_px=mm_per_px,
+        min_diameter_mm=2.0,
+        max_diameter_mm=4.0,
+    )
 
+    circle_center = image_center(img)
+    circle_radius = None
     if calib_struct is not None:
-        bl = calib_struct["bottom_left"]
-        br = calib_struct["bottom_right"]
-        top = calib_struct["top"]
-        origin_px = (
-            int((bl[0] + br[0]) / 2),
-            int((bl[1] + br[1]) / 2),
+        circle = circle_from_3_points(
+            calib_struct["top"],
+            calib_struct["bottom_left"],
+            calib_struct["bottom_right"],
         )
-        dist_top = np.sqrt((top[0] - origin_px[0]) ** 2 + (top[1] - origin_px[1]) ** 2)
-        radar_radius_px = int(dist_top * RADAR_RADIUS_FACTOR)
+        if circle is not None:
+            circle_center = (circle[0], circle[1])
+            circle_radius = circle[2]
 
-    # filtrer visuellement
-    if radar_radius_px is not None:
-        shot_points = filter_points_in_circle(shot_points, origin_px, radar_radius_px)
+    # filtrer dans le cercle
+    if circle_radius is not None:
+        shot_points = keep_points_in_circle(shot_points, circle_center, circle_radius)
 
     overlay = img.copy()
     overlay[red_mask > 0] = (0, 0, 255)
 
-    # cercle de zone (debug)
-    if radar_radius_px is not None:
-        cv2.circle(overlay, origin_px, radar_radius_px, (255, 0, 255), 2)
+    # cercle violet correctement centré
+    if circle_radius is not None:
+        cv2.circle(overlay, circle_center, circle_radius, (255, 0, 255), 2)
 
-    # calib en jaune
+    # dessiner calib
     for (x, y, area) in calib_points:
-        cv2.circle(overlay, (x, y), 10, (255, 255, 0), 2)
+        cv2.circle(overlay, (x, y), 5, (255, 255, 0), 2)
 
-    # coups en vert
+    # dessiner coups
     for (x, y, area) in shot_points:
-        cv2.circle(overlay, (x, y), 6, (0, 255, 0), 2)
+        cv2.circle(overlay, (x, y), 4, (0, 255, 0), 2)
 
     out = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
+
     tmpfile = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     cv2.imwrite(tmpfile.name, out)
     return send_file(tmpfile.name, mimetype="image/png")
@@ -336,7 +349,7 @@ def mask_route():
 def test_page():
     return """
     <html>
-      <body style="font-family:sans-serif;">
+      <body style="font-family: sans-serif;">
         <h2>Radar ToDoGolf - Test /analyze</h2>
         <form action="/analyze" method="post" enctype="multipart/form-data">
           <p><input type="file" name="image" accept="image/*" required></p>
@@ -353,7 +366,7 @@ def test_page():
 def test_mask_page():
     return """
     <html>
-      <body style="font-family:sans-serif;">
+      <body style="font-family: sans-serif;">
         <h2>Radar ToDoGolf - Test /mask</h2>
         <form id="maskForm" enctype="multipart/form-data">
           <p><input type="file" id="image" name="image" accept="image/*" required></p>
@@ -367,8 +380,7 @@ def test_mask_page():
           form.addEventListener('submit', async function(e) {
             e.preventDefault();
             const fd = new FormData();
-            const fileInput = document.getElementById('image');
-            fd.append('image', fileInput.files[0]);
+            fd.append('image', document.getElementById('image').files[0]);
             const res = await fetch('/mask', { method: 'POST', body: fd });
             const blob = await res.blob();
             const url = URL.createObjectURL(blob);
