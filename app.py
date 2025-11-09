@@ -1,216 +1,193 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+import os
+import tempfile
+from flask import Flask, request, jsonify, send_file
 import cv2
 import numpy as np
-import tempfile
 
-app = FastAPI()
+app = Flask(__name__)
 
-# ---- config radar ----
-GRID_SIZE = 12          # 12 cases x 12 cases
-SCALE_PER_CELL = 5.0    # 1 case = 5 m (long jeu)
-FORCED_GRID_SIZE_PX = 600  # taille du carré de grille dans l'image warpée
-GRID_TOP_OFFSET = 400      # position verticale de la grille dans l'image warpée
+# ====== PARAMS ======
+MIN_RED_AREA = 30
+MAX_RED_AREA = 4000
+CALIB_STEP_METERS = 10.0  # adapte ça à l’écart réel entre tes 3 repères
 
 
-def find_markers(image_gray):
-    """
-    Cherche les 3 petits repères noirs imprimés sur la feuille.
-    On les trie par (y,x) pour avoir: top-left, top-right, bottom-left.
-    """
-    _, thresh = cv2.threshold(image_gray, 60, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    markers = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
-        # filtre à ajuster selon la taille imprimée de tes repères
-        if 200 < area < 5000:
-            markers.append((x, y, w, h, cnt))
-    markers.sort(key=lambda m: (m[1], m[0]))
-    return markers
+# ====== FONCTIONS DE BASE ======
+def find_red_points(bgr_image):
+    """Détecte les points rouges dans l'image et renvoie une liste de (x, y, area)."""
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
+    # plages de rouge un peu larges pour les photos
+    lower_red_1 = np.array([0, 70, 50])
+    upper_red_1 = np.array([15, 255, 255])
 
-def warp_sheet(image, markers):
-    """
-    Redresse la feuille en se basant sur les 3 repères détectés.
-    On produit une image "warpée" de 1000x1400 px.
-    On renvoie aussi la matrice de transfo pour pouvoir projeter les points.
-    """
-    (x1, y1, w1, h1, _cnt1) = markers[0]  # top-left
-    (x2, y2, w2, h2, _cnt2) = markers[1]  # top-right
-    (x3, y3, w3, h3, _cnt3) = markers[2]  # bottom-left
+    lower_red_2 = np.array([165, 70, 50])
+    upper_red_2 = np.array([179, 255, 255])
 
-    src_pts = np.float32([
-        [x1 + w1 / 2, y1 + h1 / 2],
-        [x2 + w2 / 2, y2 + h2 / 2],
-        [x3 + w3 / 2, y3 + h3 / 2],
-        # bottom-right estimé
-        [x2 + w2 / 2 + (x3 - x1), y3 + h3 / 2 + (y2 - y1)]
-    ])
-
-    target_w = 1000
-    target_h = 1400
-    dst_pts = np.float32([
-        [100, 100],
-        [target_w - 100, 100],
-        [100, target_h - 100],
-        [target_w - 100, target_h - 100]
-    ])
-
-    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    warped = cv2.warpPerspective(image, M, (target_w, target_h))
-    return warped, M
-
-
-def detect_red_points_raw(img):
-    """
-    Détection du rouge sur l'image ORIGINALE (avant warp).
-    On élargit la plage de rouge pour couvrir feutres / lumière chaude.
-    """
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    # deux plages de rouge élargies
-    lower1 = np.array([0, 50, 40])
-    upper1 = np.array([15, 255, 255])
-
-    lower2 = np.array([160, 50, 40])
-    upper2 = np.array([180, 255, 255])
-
-    mask1 = cv2.inRange(hsv, lower1, upper1)
-    mask2 = cv2.inRange(hsv, lower2, upper2)
+    mask1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
+    mask2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
     mask = cv2.bitwise_or(mask1, mask2)
 
     # nettoyage
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=1)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    pts = []
+    points = []
     for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        area = w * h
-        # on prend même les petits points
-        if 8 < area < 8000:
-            cx = x + w // 2
-            cy = y + h // 2
-            pts.append((cx, cy))
-    return pts
-
-
-def apply_homography_to_points(points, M):
-    """
-    Projette les points détectés sur l'image d'origine vers l'image warpée
-    en utilisant la même matrice que celle utilisée pour la feuille.
-    """
-    if not points:
-        return []
-    pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
-    warped_pts = cv2.perspectiveTransform(pts, M)
-    warped_pts = warped_pts.reshape(-1, 2)
-    return [(float(x), float(y)) for (x, y) in warped_pts]
-
-
-def convert_points_to_grid(points, warped_shape):
-    """
-    Convertit les points (déjà dans l'image warpée) en coordonnées de grille.
-    Ici on FORCE la position et la taille de la grille pour coller au PDF.
-    """
-    h, w, _ = warped_shape
-
-    grid_size_px = FORCED_GRID_SIZE_PX
-    left = (w - grid_size_px) // 2  # centré horizontalement
-    top = GRID_TOP_OFFSET           # décalé vers le bas (titre au-dessus)
-
-    cell_size = grid_size_px / GRID_SIZE
-
-    grid_points = []
-    for (px, py) in points:
-        rel_x = px - left
-        rel_y = py - top
-
-        # si le point est hors du carré de grille, on l'ignore
-        if rel_x < 0 or rel_y < 0 or rel_x > grid_size_px or rel_y > grid_size_px:
+        area = cv2.contourArea(c)
+        if area < MIN_RED_AREA or area > MAX_RED_AREA:
             continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        points.append((cx, cy, area))
 
-        cell_x = rel_x / cell_size
-        cell_y = rel_y / cell_size
-
-        # on met l'origine (0,0) au centre
-        cx = cell_x - (GRID_SIZE / 2)
-        cy = (GRID_SIZE / 2) - cell_y  # y vers le haut
-
-        grid_points.append((cx, cy))
-
-    return grid_points
+    return points, mask
 
 
-@app.post("/analyse")
-async def analyse_image(
-    file: UploadFile = File(...),
-    distance_cible: float = Form(None),
-    club: str = Form(None)
-):
-    """
-    Endpoint principal :
-    - reçoit une photo (file)
-    - optionnel : distance_cible (m), club (texte)
-    - renvoie les coups en latéral/profondeur + distance absolue si dispo
-    """
-    try:
-        # 1. on sauvegarde l'image reçue
-        contents = await file.read()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp.write(contents)
-        tmp.close()
+def detect_calibration_points(points, tolerance_px=25):
+    """Cherche 3 points quasi alignés verticalement pour l'échelle."""
+    if len(points) < 3:
+        return [], points
 
-        img = cv2.imread(tmp.name)
-        if img is None:
-            return JSONResponse({"error": "Impossible de lire l'image."}, status_code=400)
+    n = len(points)
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                p1 = points[i]
+                p2 = points[j]
+                p3 = points[k]
+                xs = [p1[0], p2[0], p3[0]]
+                if max(xs) - min(xs) < tolerance_px:
+                    calib = sorted([p1, p2, p3], key=lambda p: p[1])
+                    calib_set = set((p[0], p[1]) for p in calib)
+                    others = [p for p in points if (p[0], p[1]) not in calib_set]
+                    return calib, others
 
-        # 2. on trouve les repères
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        markers = find_markers(gray)
-        if len(markers) < 3:
-            return JSONResponse({"error": "Pas assez de repères détectés."}, status_code=400)
+    return [], points
 
-        # 3. on redresse la feuille
-        warped, M = warp_sheet(img, markers)
 
-        # 4. on détecte les points rouges sur l'image d'origine
-        raw_red_points = detect_red_points_raw(img)
+def compute_scale_from_calib(calib_points):
+    if len(calib_points) < 2:
+        return None
+    p_top = calib_points[0]
+    p_mid = calib_points[1]
+    dist_px = abs(p_mid[1] - p_top[1])
+    if dist_px == 0:
+        return None
+    return CALIB_STEP_METERS / dist_px
 
-        # 5. on projette ces points vers l'image warpée
-        warped_red_points = apply_homography_to_points(raw_red_points, M)
 
-        # 6. on convertit en coordonnées de grille
-        grid_pts = convert_points_to_grid(warped_red_points, warped.shape)
+def image_center(img):
+    h, w = img.shape[:2]
+    return (w // 2, h // 2)
 
-        # 7. on transforme en mètres
-        coups = []
-        for (gx, gy) in grid_pts:
-            lateral_m = round(gx * SCALE_PER_CELL, 2)
-            profondeur_m = round(gy * SCALE_PER_CELL, 2)
 
-            # distance absolue si on a la distance cible
-            distance_absolue = None
-            if distance_cible is not None:
-                distance_absolue = round(distance_cible + profondeur_m, 2)
+def compute_shot_metrics(shots_px, origin_px, meters_per_px):
+    results = []
+    ox, oy = origin_px
+    for (x, y, area) in shots_px:
+        dx_px = x - ox
+        dy_px = oy - y  # inversion Y
+        dx_m = dx_px * meters_per_px
+        dy_m = dy_px * meters_per_px
+        dist_m = float(np.sqrt(dx_m ** 2 + dy_m ** 2))
+        results.append({
+            "x_m": round(dx_m, 2),
+            "y_m": round(dy_m, 2),
+            "distance_m": round(dist_m, 2),
+            "lateral_m": round(dx_m, 2),
+        })
+    return results
 
-            coups.append({
-                "lateral_m": lateral_m,
-                "profondeur_m": profondeur_m,
-                "distance_absolue_m": distance_absolue
-            })
 
-        return {
-            "club": club,
-            "distance_cible": distance_cible,
-            "nb_coups": len(coups),
-            "coups": coups
+# ====== ROUTES ======
+@app.route("/", methods=["GET"])
+def index():
+    return "Radar Distance API (Render) OK", 200
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    """Route principale: renvoie le JSON avec les coups."""
+    if "image" not in request.files:
+        return jsonify({"error": "Aucune image envoyée"}), 400
+
+    file_storage = request.files["image"]
+    file_bytes = np.frombuffer(file_storage.read(), np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if img is None:
+        return jsonify({"error": "Impossible de lire l'image"}), 400
+
+    club = request.form.get("club", "Inconnu")
+    distance_cible = float(request.form.get("distance_cible", 0))
+    centre_distance = request.form.get("centre_distance")
+    centre_distance = float(centre_distance) if centre_distance else None
+
+    all_points, _ = find_red_points(img)
+    calib_points, shot_points = detect_calibration_points(all_points)
+
+    meters_per_px = compute_scale_from_calib(calib_points) if calib_points else None
+    if meters_per_px is None:
+        meters_per_px = 0.1  # fallback
+
+    if calib_points:
+        origin_px = (calib_points[0][0], calib_points[0][1])
+    else:
+        origin_px = image_center(img)
+
+    coups = compute_shot_metrics(shot_points, origin_px, meters_per_px)
+
+    return jsonify({
+        "club": club,
+        "distance_cible": distance_cible,
+        "centre_distance": centre_distance,
+        "nb_coups": len(coups),
+        "coups": coups,
+        "debug": {
+            "nb_points_total": len(all_points),
+            "nb_points_calib": len(calib_points),
+            "meters_per_px": meters_per_px,
+            "origin_px": origin_px,
         }
+    })
 
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.route("/mask", methods=["POST"])
+def get_mask():
+    """Route debug: renvoie l'image annotée avec les zones rouges trouvées."""
+    if "image" not in request.files:
+        return jsonify({"error": "Aucune image envoyée"}), 400
+
+    file_storage = request.files["image"]
+    file_bytes = np.frombuffer(file_storage.read(), np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if img is None:
+        return jsonify({"error": "Impossible de lire l'image"}), 400
+
+    points, mask = find_red_points(img)
+
+    # overlay rouge
+    overlay = img.copy()
+    overlay[mask > 0] = (0, 0, 255)
+    out = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
+
+    # dessine un rond vert sur chaque point détecté
+    for (x, y, area) in points:
+        cv2.circle(out, (x, y), 6, (0, 255, 0), 2)
+
+    tmpfile = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    cv2.imwrite(tmpfile.name, out)
+
+    return send_file(tmpfile.name, mimetype="image/png")
+
+
+if __name__ == "__main__":
+    # Render donne le port dans $PORT
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
