@@ -6,14 +6,26 @@ import numpy as np
 
 app = Flask(__name__)
 
-CALIB_STEP_METERS = 10.0
-MIN_RED_AREA = 30
-MAX_RED_AREA = 4000
+# ---- paramètres à ajuster ----
+CALIB_STEP_METERS = 10.0   # distance réelle entre les 2 points de calibration du bas
+MIN_RED_AREA = 150         # on a augmenté pour éviter le bruit
+MAX_RED_AREA = 5000
 
 
+# =========================
+# DÉTECTION DES IMPACTS ROUGES
+# =========================
 def find_red_points(bgr_image):
+    """
+    Détecte les impacts rouges en étant plus strict :
+    - zone rouge en HSV
+    - nettoyage morpho plus fort
+    - filtre de taille
+    - filtre de forme (aspect ~ carré/rond)
+    """
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
+    # deux plages de rouge
     lower_red_1 = np.array([0, 70, 50])
     upper_red_1 = np.array([15, 255, 255])
     lower_red_2 = np.array([165, 70, 50])
@@ -23,17 +35,28 @@ def find_red_points(bgr_image):
     mask2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
     mask = cv2.bitwise_or(mask1, mask2)
 
+    # nettoyage un peu plus fort
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     points = []
     for c in contours:
         area = cv2.contourArea(c)
+        # 1) filtre de taille (on vire le bruit)
         if area < MIN_RED_AREA or area > MAX_RED_AREA:
             continue
+
+        # 2) filtre de forme (on veut pas des trucs trop allongés)
+        x, y, w, h = cv2.boundingRect(c)
+        if h == 0:
+            continue
+        aspect_ratio = w / h
+        if aspect_ratio < 0.5 or aspect_ratio > 1.5:
+            continue
+
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
@@ -44,8 +67,15 @@ def find_red_points(bgr_image):
     return points, mask
 
 
+# =========================
+# DÉTECTION DES 3 RONDS NOIRS (CALIBRATION)
+# =========================
 def find_black_calibration_points(bgr_image):
+    """
+    On détecte les 3 ronds noirs du gabarit noir & blanc.
+    """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+    # seuil inversé : noir devient blanc
     _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
 
     kernel = np.ones((3, 3), np.uint8)
@@ -65,20 +95,28 @@ def find_black_calibration_points(bgr_image):
         cy = int(M["m01"] / M["m00"])
         candidates.append((cx, cy, area))
 
+    # on prend les 3 plus gros
     candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
     return candidates[:3], thresh
 
 
 def order_calibration_points(calib_points):
+    """
+    On sait que le gabarit a 1 point en haut et 2 en bas.
+    On les range donc en top, bottom_left, bottom_right.
+    """
     if len(calib_points) < 3:
         return None
-    pts = sorted(calib_points, key=lambda p: p[1])
+
+    pts = sorted(calib_points, key=lambda p: p[1])  # y croissant
     top = pts[0]
     bottom1, bottom2 = pts[1], pts[2]
+
     if bottom1[0] < bottom2[0]:
         bottom_left, bottom_right = bottom1, bottom2
     else:
         bottom_left, bottom_right = bottom2, bottom1
+
     return {"top": top, "bottom_left": bottom_left, "bottom_right": bottom_right}
 
 
@@ -96,23 +134,30 @@ def image_center(img):
     return (w // 2, h // 2)
 
 
+# =========================
+# CALCUL DES COUPS
+# =========================
 def compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=None):
     """
-    centre_distance: distance réelle du centre (en m) si fournie par l'utilisateur.
-    On ajoute distance_to_center_m dans chaque coup.
+    shot_points: liste de (x, y, area) en pixels
+    origin_px: (x0, y0) centre du radar en pixels
+    meters_per_px: échelle
+    centre_distance: distance réelle du centre (ex: 170) -> permet de calculer distance_to_center_m
     """
     results = []
     ox, oy = origin_px
+
     for (x, y, area) in shot_points:
         dx_px = x - ox
-        dy_px = oy - y  # inversion Y
-        dx_m = dx_px * meters_per_px
-        dy_m = dy_px * meters_per_px
+        dy_px = oy - y  # inversion Y image
+        dx_m = dx_px * meters_per_px       # latéral
+        dy_m = dy_px * meters_per_px       # profondeur
         dist_m = float(np.sqrt(dx_m ** 2 + dy_m ** 2))
 
-        # distance au centre (0, centre_distance)
+        # distance au centre réel si fourni
         if centre_distance is not None:
-            diff_x = dx_m  # centre est à x=0
+            # centre réel = (0, centre_distance)
+            diff_x = dx_m
             diff_y = dy_m - centre_distance
             dist_center = float(np.sqrt(diff_x ** 2 + diff_y ** 2))
             dist_center = round(dist_center, 2)
@@ -120,18 +165,21 @@ def compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=
             dist_center = None
 
         results.append({
-            "x_m": round(dx_m, 2),
-            "y_m": round(dy_m, 2),
-            "distance_m": round(dist_m, 2),
-            "distance_to_center_m": dist_center,
-            "lateral_m": round(dx_m, 2),
+            "profondeur_m": round(dy_m, 2),          # distance vers la cible
+            "lateral_m": round(dx_m, 2),             # gauche / droite
+            "distance_m": round(dist_m, 2),          # distance depuis l'origine
+            "distance_to_center_m": dist_center,     # écart par rapport au centre réel
         })
+
     return results
 
 
+# =========================
+# ROUTES
+# =========================
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API (distance centre incluse) OK", 200
+    return "Radar ToDoGolf API (strict points + test_mask) OK", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -149,14 +197,18 @@ def analyze():
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
 
+    # 1. calibration
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
 
+    # 2. coups
     shot_points, _ = find_red_points(img)
 
+    # 3. origine + échelle
     meters_per_px = None
     origin_px = image_center(img)
-    if calib_struct:
+
+    if calib_struct is not None:
         bl = calib_struct["bottom_left"]
         br = calib_struct["bottom_right"]
         origin_px = (
@@ -166,7 +218,7 @@ def analyze():
         meters_per_px = compute_scale_from_bottom(bl, br)
 
     if meters_per_px is None:
-        meters_per_px = 0.1
+        meters_per_px = 0.1  # fallback
 
     coups = compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=centre_distance)
 
@@ -177,6 +229,7 @@ def analyze():
         "coups": coups,
         "debug": {
             "nb_points_calib": len(calib_points),
+            "nb_points_rouges": len(shot_points),
             "meters_per_px": meters_per_px,
             "origin_px": origin_px,
         }
@@ -185,6 +238,11 @@ def analyze():
 
 @app.route("/mask", methods=["POST"])
 def mask_route():
+    """
+    Retourne une image PNG annotée :
+    - zones rouges détectées
+    - points de calibration en jaune
+    """
     if "image" not in request.files:
         return jsonify({"error": "Aucune image envoyée"}), 400
 
@@ -198,13 +256,20 @@ def mask_route():
     calib_points, _ = find_black_calibration_points(img)
 
     overlay = img.copy()
+
+    # colorer le rouge trouvé
     overlay[red_mask > 0] = (0, 0, 255)
+
+    # calib en jaune
     for (x, y, area) in calib_points:
         cv2.circle(overlay, (x, y), 10, (255, 255, 0), 2)
+
+    # coups en vert
     for (x, y, area) in shot_points:
         cv2.circle(overlay, (x, y), 6, (0, 255, 0), 2)
 
     out = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
+
     tmpfile = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     cv2.imwrite(tmpfile.name, out)
     return send_file(tmpfile.name, mimetype="image/png")
@@ -215,13 +280,46 @@ def test_page():
     return """
     <html>
       <body style="font-family: sans-serif;">
-        <h2>Radar ToDoGolf - Test API</h2>
+        <h2>Radar ToDoGolf - Test /analyze</h2>
         <form action="/analyze" method="post" enctype="multipart/form-data">
           <p><input type="file" name="image" accept="image/*" required></p>
           <p><input type="text" name="club" placeholder="Ex: Fer7"></p>
           <p><input type="number" step="0.1" name="centre_distance" placeholder="Ex: 170"></p>
           <button type="submit">Analyser</button>
         </form>
+      </body>
+    </html>
+    """
+
+
+@app.route("/test_mask", methods=["GET"])
+def test_mask_page():
+    return """
+    <html>
+      <body style="font-family: sans-serif;">
+        <h2>Radar ToDoGolf - Test /mask</h2>
+        <form id="maskForm" enctype="multipart/form-data">
+          <p><input type="file" id="image" name="image" accept="image/*" required></p>
+          <button type="submit">Afficher le masque</button>
+        </form>
+        <div style="margin-top:20px;">
+          <img id="maskImage" style="max-width:100%; display:none;">
+        </div>
+        <script>
+          const form = document.getElementById('maskForm');
+          form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const fd = new FormData();
+            const fileInput = document.getElementById('image');
+            fd.append('image', fileInput.files[0]);
+            const res = await fetch('/mask', { method: 'POST', body: fd });
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const img = document.getElementById('maskImage');
+            img.src = url;
+            img.style.display = 'block';
+          });
+        </script>
       </body>
     </html>
     """
