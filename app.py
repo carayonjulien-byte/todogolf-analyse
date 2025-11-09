@@ -7,20 +7,19 @@ import numpy as np
 app = Flask(__name__)
 
 # ---------------------------
-# PARAMÈTRES GÉNÉRAUX
+# PARAMS
 # ---------------------------
 MIN_RED_AREA_FALLBACK = 100
 MAX_RED_AREA_FALLBACK = 5000
-# si pas précisé on part sur 5m
-DEFAULT_RING_STEP_M = 5.0
-NB_RINGS = 4  # tu as dit : c'est toujours 4 cercles
+DEFAULT_RING_STEP_M = 5.0  # si pas de mode précisé
+NB_RINGS = 4               # tu as dit : toujours 4 cercles
 
 
 # ---------------------------
-# OUTILS GÉOMÉTRIQUES
+# GÉOMÉTRIE
 # ---------------------------
 def circle_from_3_points(p1, p2, p3):
-    """Renvoie (cx, cy, r) du cercle passant par 3 points (x, y)."""
+    """Renvoie (cx, cy, r) du cercle passant par 3 points."""
     x1, y1 = p1[0], p1[1]
     x2, y2 = p2[0], p2[1]
     x3, y3 = p3[0], p3[1]
@@ -39,11 +38,6 @@ def circle_from_3_points(p1, p2, p3):
     return (int(cx), int(cy), int(r))
 
 
-def image_center(img):
-    h, w = img.shape[:2]
-    return (w // 2, h // 2)
-
-
 def keep_points_in_circle(points, center, radius_px):
     if center is None or radius_px is None:
         return points
@@ -59,6 +53,7 @@ def keep_points_in_circle(points, center, radius_px):
 # DÉTECTIONS
 # ---------------------------
 def find_black_calibration_points(bgr_image):
+    """Détecte les 3 plus gros ronds noirs posés sur le cercle extérieur."""
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
     kernel = np.ones((3, 3), np.uint8)
@@ -82,20 +77,20 @@ def find_black_calibration_points(bgr_image):
 
 
 def order_calibration_points(calib_points):
+    """on veut juste les 3 dans un dict lisible."""
     if len(calib_points) < 3:
         return None
-    pts = sorted(calib_points, key=lambda p: p[1])  # tri vertical
-    top = pts[0]
-    bottom1, bottom2 = pts[1], pts[2]
-    if bottom1[0] < bottom2[0]:
-        bottom_left, bottom_right = bottom1, bottom2
-    else:
-        bottom_left, bottom_right = bottom2, bottom1
-    return {"top": top, "bottom_left": bottom_left, "bottom_right": bottom_right}
+    # on ne force pas top/bottom ici puisque tous sont sur le cercle, mais on range
+    # on garde juste comme ça
+    return {
+        "p1": calib_points[0],
+        "p2": calib_points[1],
+        "p3": calib_points[2],
+    }
 
 
 def find_red_points(bgr_image, min_area=MIN_RED_AREA_FALLBACK, max_area=MAX_RED_AREA_FALLBACK):
-    """Détecte les impacts rouges (version simple sans mm/px)."""
+    """Détecte les impacts rouges."""
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
     lower_red_1 = np.array([0, 70, 50])
     upper_red_1 = np.array([15, 255, 255])
@@ -177,7 +172,7 @@ def build_resume(coups, centre_distance=None):
 # ---------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API – version simple 4 cercles fixes", 200
+    return "Radar ToDoGolf API – scénario B (3 repères sur le cercle)", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -194,7 +189,7 @@ def analyze():
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
 
-    # mode de légende : circles = 5m, squares = 1m
+    # 1m ou 5m
     calib_mode = request.form.get("calib_mode")
     if calib_mode == "circles":
         ring_step_m = 5.0
@@ -207,49 +202,42 @@ def analyze():
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
 
-    # 2. points rouges
+    if calib_struct is None:
+        return jsonify({"error": "Impossible de trouver les 3 repères noirs"}), 400
+
+    # 2. cercle radar à partir des 3 repères (scénario B)
+    p1 = (calib_struct["p1"][0], calib_struct["p1"][1])
+    p2 = (calib_struct["p2"][0], calib_struct["p2"][1])
+    p3 = (calib_struct["p3"][0], calib_struct["p3"][1])
+    circle = circle_from_3_points(p1, p2, p3)
+    if circle is None:
+        return jsonify({"error": "Les 3 repères sont trop alignés"}), 400
+
+    radar_center = (circle[0], circle[1])
+    outer_radius_px = circle[2]
+
+    # 3. points rouges
     shot_points, _ = find_red_points(img)
+    shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
-    # 3. centre + rayon du radar à partir des 3 points
-    circle_center = image_center(img)
-    outer_radius_px = None
-    if calib_struct:
-        circle = circle_from_3_points(
-            calib_struct["top"],
-            calib_struct["bottom_left"],
-            calib_struct["bottom_right"],
-        )
-        if circle:
-            circle_center = (circle[0], circle[1])
-            outer_radius_px = circle[2]
-
-    # si on n'a pas réussi, on prend au moins le centre image + rayon = min(w,h)/2
-    if outer_radius_px is None:
-        h, w = img.shape[:2]
-        outer_radius_px = min(h, w) // 2
-
-    # 4. on filtre les points dehors
-    shot_points = keep_points_in_circle(shot_points, circle_center, outer_radius_px)
-
-    # 5. échelle latérale : max_m / outer_radius_px
-    max_distance_m = ring_step_m * NB_RINGS  # ex: 4x5 = 20m
+    # 4. échelle
+    max_distance_m = ring_step_m * NB_RINGS  # 4x1 ou 4x5
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
-    # 6. calcul des coups
+    # 5. calcul des coups
     coups = []
-    cx, cy = circle_center
+    cx, cy = radar_center
     for (x, y, area) in shot_points:
-        # latéral en m
+        # latéral
         dx_px = x - cx
         lateral_m = round(dx_px * meters_per_px, 2)
 
-        # distance locale (entre 0 et max_distance_m) par interpolation sur le rayon
+        # distance locale selon rayon
         r_point_px = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
         frac = r_point_px / float(outer_radius_px) if outer_radius_px > 0 else 0
-        local_distance_m = frac * max_distance_m
-        local_distance_m = round(local_distance_m, 2)
+        local_distance_m = round(frac * max_distance_m, 2)
 
-        # distance finale (= ce que tu veux vraiment retourner)
+        # distance finale
         if centre_distance is not None:
             distance_finale = round(centre_distance + local_distance_m, 2)
         else:
@@ -260,7 +248,7 @@ def analyze():
             "lateral_m": lateral_m
         })
 
-    # 7. résumé
+    # 6. résumé
     resume = build_resume(coups, centre_distance=centre_distance)
 
     return jsonify({
@@ -271,12 +259,11 @@ def analyze():
         "coups": coups,
         "debug": {
             "nb_points_calib": len(calib_points),
-            "nb_points_rouges": len(shot_points),
-            "origin_px": list(circle_center),
+            "origin_px": list(radar_center),
             "outer_radius_px": outer_radius_px,
-            "meters_per_px": meters_per_px,
             "ring_step_m": ring_step_m,
             "max_distance_m": max_distance_m,
+            "meters_per_px": meters_per_px,
         }
     })
 
@@ -295,36 +282,33 @@ def mask_route():
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
 
-    circle_center = image_center(img)
-    outer_radius_px = None
-    if calib_struct:
-        circle = circle_from_3_points(
-            calib_struct["top"],
-            calib_struct["bottom_left"],
-            calib_struct["bottom_right"],
-        )
-        if circle:
-            circle_center = (circle[0], circle[1])
-            outer_radius_px = circle[2]
+    if calib_struct is None:
+        return jsonify({"error": "Impossible de trouver les 3 repères noirs"}), 400
 
-    if outer_radius_px is None:
-        h, w = img.shape[:2]
-        outer_radius_px = min(h, w) // 2
+    p1 = (calib_struct["p1"][0], calib_struct["p1"][1])
+    p2 = (calib_struct["p2"][0], calib_struct["p2"][1])
+    p3 = (calib_struct["p3"][0], calib_struct["p3"][1])
+    circle = circle_from_3_points(p1, p2, p3)
+    if circle is None:
+        return jsonify({"error": "Les 3 repères sont trop alignés"}), 400
+
+    radar_center = (circle[0], circle[1])
+    outer_radius_px = circle[2]
 
     # rouges
     shot_points, red_mask = find_red_points(img)
-    shot_points = keep_points_in_circle(shot_points, circle_center, outer_radius_px)
+    shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
     overlay = img.copy()
     overlay[red_mask > 0] = (0, 0, 255)
 
     # cercle principal
-    cv2.circle(overlay, circle_center, outer_radius_px, (255, 0, 255), 2)
+    cv2.circle(overlay, radar_center, outer_radius_px, (255, 0, 255), 2)
 
-    # 3 cercles intermédiaires (pour visualiser l’échelle)
+    # cercles intermédiaires
     for i in range(1, NB_RINGS):
         r = int(outer_radius_px * (i / NB_RINGS))
-        cv2.circle(overlay, circle_center, r, (0, 255, 255), 1)
+        cv2.circle(overlay, radar_center, r, (0, 255, 255), 1)
 
     # points calib
     for (x, y, area) in calib_points:
@@ -347,14 +331,14 @@ def mask_route():
 def test_page():
     return """
     <html><body style='font-family:sans-serif'>
-    <h2>Radar ToDoGolf – Test /analyze</h2>
+    <h2>Radar ToDoGolf – Test /analyze (scénario B)</h2>
     <form action="/analyze" method="post" enctype="multipart/form-data">
       <p><input type="file" name="image" required></p>
       <p><input type="text" name="club" placeholder="Ex: Fer7"></p>
       <p><input type="number" step="0.1" name="centre_distance" placeholder="Ex: 100"></p>
       <p>
         <select name="calib_mode">
-          <option value="">-- mode de calib --</option>
+          <option value="">(défaut 5 m)</option>
           <option value="circles">cercles (5 m)</option>
           <option value="squares">carrés (1 m)</option>
         </select>
