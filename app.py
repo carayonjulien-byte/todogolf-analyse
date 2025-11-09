@@ -160,42 +160,73 @@ def find_red_points(bgr_image, mm_per_px=None, min_diameter_mm=2.0, max_diameter
 
 
 # ---------------------------
-# CALCUL DES COUPS
+# CALCUL DES COUPS (version light)
 # ---------------------------
-def compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=None, radar_radius_px=None):
+def compute_shot_metrics(shot_points, origin_px, meters_per_px):
+    """
+    Retourne uniquement profondeur_m et lateral_m par coup.
+    """
     results = []
     ox, oy = origin_px
-
     for (x, y, area) in shot_points:
         dx_px = x - ox
-        dy_px = oy - y  # inversion Y
+        dy_px = oy - y
         dx_m = dx_px * meters_per_px
         dy_m = dy_px * meters_per_px
-        dist_m = float(math.sqrt(dx_m ** 2 + dy_m ** 2))
-
-        angle_rad = math.atan2(dx_px, dy_px)
-        angle_deg = math.degrees(angle_rad)
-
-        dist_center = None
-        if centre_distance is not None:
-            diff_x = dx_m
-            diff_y = dy_m - centre_distance
-            dist_center = round(math.sqrt(diff_x ** 2 + diff_y ** 2), 2)
-
-        depth_percent = None
-        if radar_radius_px is not None and radar_radius_px > 0:
-            depth_percent = round((dy_px / radar_radius_px) * 100.0, 1)
-
         results.append({
             "profondeur_m": round(dy_m, 2),
             "lateral_m": round(dx_m, 2),
-            "distance_m": round(dist_m, 2),
-            "distance_to_center_m": dist_center,
-            "angle_deg": round(angle_deg, 1),
-            "depth_percent": depth_percent,
         })
-
     return results
+
+
+def build_resume(coups, centre_distance=None):
+    """
+    Fabrique un petit résumé à partir de la liste des coups.
+    """
+    if not coups:
+        return {
+            "moyenne_profondeur_m": None,
+            "moyenne_lateral_m": None,
+            "dispersion_profondeur_m": None,
+            "dispersion_lateral_m": None,
+            "tendance": "aucun coup détecté"
+        }
+
+    profs = np.array([c["profondeur_m"] for c in coups], dtype=float)
+    lats = np.array([c["lateral_m"] for c in coups], dtype=float)
+
+    moyenne_profondeur = float(np.mean(profs))
+    moyenne_lateral = float(np.mean(lats))
+    dispersion_profondeur = float(np.std(profs, ddof=0))
+    dispersion_lateral = float(np.std(lats, ddof=0))
+
+    # tendance profondeur
+    tendance_parts = []
+    if centre_distance is not None:
+        diff = moyenne_profondeur - centre_distance
+        if diff < -1.0:
+            tendance_parts.append("court")
+        elif diff > 1.0:
+            tendance_parts.append("long")
+    # tendance latérale
+    if moyenne_lateral < -0.5:
+        tendance_parts.append("gauche")
+    elif moyenne_lateral > 0.5:
+        tendance_parts.append("droite")
+
+    if not tendance_parts:
+        tendance = "dans l'axe"
+    else:
+        tendance = " et ".join(tendance_parts)
+
+    return {
+        "moyenne_profondeur_m": round(moyenne_profondeur, 2),
+        "moyenne_lateral_m": round(moyenne_lateral, 2),
+        "dispersion_profondeur_m": round(dispersion_profondeur, 2),
+        "dispersion_lateral_m": round(dispersion_lateral, 2),
+        "tendance": tendance
+    }
 
 
 # ---------------------------
@@ -203,7 +234,7 @@ def compute_shot_metrics(shot_points, origin_px, meters_per_px, centre_distance=
 # ---------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API – calcul complet (v.11-09) OK", 200
+    return "Radar ToDoGolf API – version light avec résumé", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -217,37 +248,53 @@ def analyze():
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
     club = request.form.get("club", "Inconnu")
-    centre_distance = float(request.form.get("centre_distance", 0)) or None
+    centre_distance = request.form.get("centre_distance")
+    centre_distance = float(centre_distance) if centre_distance else None
 
+    # 1. calibration
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
+
+    # 2. mm/pixel
     mm_per_px = estimate_mm_per_px_from_calib(calib_points[0][2]) if calib_points else None
+
+    # 3. points rouges (2–4 mm)
     shot_points, _ = find_red_points(img, mm_per_px=mm_per_px)
 
+    # 4. centre + rayon depuis les 3 repères
     circle_center = image_center(img)
     circle_radius = None
     if calib_struct:
-        circle = circle_from_3_points(calib_struct["top"], calib_struct["bottom_left"], calib_struct["bottom_right"])
+        circle = circle_from_3_points(
+            calib_struct["top"],
+            calib_struct["bottom_left"],
+            calib_struct["bottom_right"],
+        )
         if circle:
             circle_center = (circle[0], circle[1])
             circle_radius = circle[2]
 
+    # 5. échelle mètres
     meters_per_px = compute_scale_from_bottom(
-        calib_struct["bottom_left"], calib_struct["bottom_right"]
+        calib_struct["bottom_left"],
+        calib_struct["bottom_right"]
     ) if calib_struct else 0.1
 
+    # 6. on vire les points dehors
     if circle_radius:
         shot_points = keep_points_in_circle(shot_points, circle_center, circle_radius)
 
-    coups = compute_shot_metrics(
-        shot_points, circle_center, meters_per_px,
-        centre_distance=centre_distance, radar_radius_px=circle_radius
-    )
+    # 7. calcul coups (light)
+    coups = compute_shot_metrics(shot_points, circle_center, meters_per_px)
+
+    # 8. résumé global
+    resume = build_resume(coups, centre_distance=centre_distance)
 
     return jsonify({
         "club": club,
         "centre_distance": centre_distance,
         "nb_coups": len(coups),
+        "resume": resume,
         "coups": coups,
         "debug": {
             "nb_points_calib": len(calib_points),
@@ -277,7 +324,11 @@ def mask_route():
     circle_center = image_center(img)
     circle_radius = None
     if calib_struct:
-        circle = circle_from_3_points(calib_struct["top"], calib_struct["bottom_left"], calib_struct["bottom_right"])
+        circle = circle_from_3_points(
+            calib_struct["top"],
+            calib_struct["bottom_left"],
+            calib_struct["bottom_right"],
+        )
         if circle:
             circle_center = (circle[0], circle[1])
             circle_radius = circle[2]
@@ -290,8 +341,10 @@ def mask_route():
 
     if circle_radius:
         cv2.circle(overlay, circle_center, circle_radius, (255, 0, 255), 2)
+
     for (x, y, area) in calib_points:
         cv2.circle(overlay, (x, y), 5, (255, 255, 0), 2)
+
     for (x, y, area) in shot_points:
         cv2.circle(overlay, (x, y), 4, (0, 255, 0), 2)
 
