@@ -7,20 +7,16 @@ import math
 
 app = Flask(__name__)
 
-# ---------------------------
-# PARAMS
-# ---------------------------
 MIN_RED_AREA_FALLBACK = 100
 MAX_RED_AREA_FALLBACK = 5000
-DEFAULT_RING_STEP_M = 5.0  # si pas de mode précisé
-NB_RINGS = 4               # toujours 4 cercles
+DEFAULT_RING_STEP_M = 5.0
+NB_RINGS = 4  # toujours 4 anneaux
 
 
 # ---------------------------
 # GÉOMÉTRIE
 # ---------------------------
 def circle_from_3_points(p1, p2, p3):
-    """Renvoie (cx, cy, r) du cercle passant par 3 points."""
     x1, y1 = p1
     x2, y2 = p2
     x3, y3 = p3
@@ -36,7 +32,7 @@ def circle_from_3_points(p1, p2, p3):
     cx = (bc * (y2 - y3) - cd * (y1 - y2)) / det
     cy = ((x1 - x2) * cd - (x2 - x3) * bc) / det
     r = math.sqrt((cx - x1)**2 + (cy - y1)**2)
-    return (cx, cy, r)  # on garde les floats
+    return (cx, cy, r)
 
 
 def keep_points_in_circle(points, center, radius_px):
@@ -45,7 +41,7 @@ def keep_points_in_circle(points, center, radius_px):
     cx, cy = center
     kept = []
     for (x, y, area) in points:
-        if (x - cx) ** 2 + (y - cy) ** 2 <= radius_px ** 2:
+        if (x - cx)**2 + (y - cy)**2 <= radius_px**2:
             kept.append((x, y, area))
     return kept
 
@@ -55,37 +51,45 @@ def keep_points_in_circle(points, center, radius_px):
 # ---------------------------
 def find_black_calibration_points(bgr_image):
     """
-    Détecte les 3 repères noirs.
-    On filtre par aire pour ignorer le gros cercle du radar.
+    Nouvelle version :
+    - on détecte tous les petits objets noirs
+    - on prend les 3 plus éloignés du centre de l'image
+    → ça marche parce que tes 3 repères sont sur le cercle extérieur
     """
+    h, w = bgr_image.shape[:2]
+    img_center = (w / 2.0, h / 2.0)
+
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
     kernel = np.ones((3, 3), np.uint8)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        # 👇 ces bornes sont importantes :
-        # - >50 : on vire le bruit
-        # - <2000 : on vire le gros cercle
-        if area < 50 or area > 2000:
+        # on vire le très petit bruit
+        if area < 30:
             continue
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
         cx = float(M["m10"] / M["m00"])
         cy = float(M["m01"] / M["m00"])
-        candidates.append((cx, cy, area))
+        # distance au centre de l'image
+        dist = math.sqrt((cx - img_center[0])**2 + (cy - img_center[1])**2)
+        candidates.append((cx, cy, area, dist))
 
-    # on veut exactement les 3 plus gros "petits" ronds
-    candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
-    return candidates[:3], thresh
+    # on prend les 3 PLUS LOIN du centre de l'image
+    candidates = sorted(candidates, key=lambda p: p[3], reverse=True)
+    top3 = candidates[:3]
+
+    # on renvoie sans la distance
+    return [(c[0], c[1], c[2]) for c in top3], thresh
 
 
 def order_calibration_points(calib_points):
-    """On retourne juste un dict avec 3 points nommés."""
     if len(calib_points) < 3:
         return None
     return {
@@ -96,7 +100,6 @@ def order_calibration_points(calib_points):
 
 
 def find_red_points(bgr_image, min_area=MIN_RED_AREA_FALLBACK, max_area=MAX_RED_AREA_FALLBACK):
-    """Détecte les impacts rouges."""
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
     lower_red_1 = np.array([0, 70, 50])
     upper_red_1 = np.array([15, 255, 255])
@@ -178,7 +181,7 @@ def build_resume(coups, centre_distance=None):
 # ---------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API – scénario B (3 repères sur le cercle)", 200
+    return "Radar ToDoGolf API – scénario B (3 repères sur le cercle, tri par distance)", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -203,16 +206,16 @@ def analyze():
     else:
         ring_step_m = DEFAULT_RING_STEP_M
 
-    # 1. repères
+    # repères
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
     if calib_struct is None:
         return jsonify({"error": "3 repères noirs non détectés"}), 400
 
-    # 2. cercle radar
     p1 = (calib_struct["p1"][0], calib_struct["p1"][1])
     p2 = (calib_struct["p2"][0], calib_struct["p2"][1])
     p3 = (calib_struct["p3"][0], calib_struct["p3"][1])
+
     circle = circle_from_3_points(p1, p2, p3)
     if circle is None:
         return jsonify({"error": "repères trop alignés"}), 400
@@ -220,15 +223,13 @@ def analyze():
     radar_center = (circle[0], circle[1])
     outer_radius_px = circle[2]
 
-    # 3. impacts
+    # impacts
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
-    # 4. échelle
     max_distance_m = ring_step_m * NB_RINGS
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
-    # 5. coups
     coups = []
     cx, cy = radar_center
     for (x, y, area) in shot_points:
@@ -293,14 +294,13 @@ def mask_route():
     radar_center = (circle[0], circle[1])
     outer_radius_px = circle[2]
 
-    # rouges
     shot_points, red_mask = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
     overlay = img.copy()
     overlay[red_mask > 0] = (0, 0, 255)
 
-    # cercle principal (on arrondit seulement au moment de dessiner)
+    # cercle principal
     cv2.circle(
         overlay,
         (int(round(radar_center[0])), int(round(radar_center[1]))),
@@ -320,7 +320,7 @@ def mask_route():
             1
         )
 
-    # repères (pour vérif)
+    # repères détectés (pour debug)
     for (x, y, area) in calib_points:
         cv2.circle(overlay, (int(x), int(y)), 6, (0, 255, 255), 2)
 
@@ -335,7 +335,7 @@ def mask_route():
 
 
 # ---------------------------
-# TEST PAGES
+# PAGES DE TEST
 # ---------------------------
 @app.route("/test")
 def test_page():
