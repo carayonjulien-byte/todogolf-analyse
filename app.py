@@ -3,30 +3,32 @@ import tempfile
 from flask import Flask, request, jsonify, send_file
 import cv2
 import numpy as np
+import math
 
 app = Flask(__name__)
 
-# ---------------------------
-# CONSTANTES GÉNÉRALES
-# ---------------------------
-CALIB_MIN_AREA = 80      # aire minimale des repères noirs
-CALIB_MAX_AREA = 4000    # aire maximale des repères noirs
+# --------------------------------
+# CONSTANTES
+# --------------------------------
+CALIB_MIN_AREA = 80
+CALIB_MAX_AREA = 4000
 MIN_RED_AREA_FALLBACK = 100
 MAX_RED_AREA_FALLBACK = 5000
-NB_RINGS = 4             # nombre d'anneaux visibles sur le radar
-DEFAULT_RING_STEP_M = 5.0  # écart par anneau si non précisé
+NB_RINGS = 4
+DEFAULT_RING_STEP_M = 5.0
+# si les 3 repères ne sont pas assez espacés verticalement, on considère que c'est foireux
+MIN_REPERE_VERTICAL_SPREAD = 50  # px
 
 
-# ---------------------------
-# OUTILS GÉOMÉTRIQUES
-# ---------------------------
+# --------------------------------
+# OUTILS
+# --------------------------------
 def image_center(img):
     h, w = img.shape[:2]
     return (w // 2, h // 2)
 
 
 def keep_points_in_circle(points, center, radius_px):
-    """Ne garde que les points à l'intérieur du radar."""
     if center is None or radius_px is None:
         return points
     cx, cy = center
@@ -37,15 +39,29 @@ def keep_points_in_circle(points, center, radius_px):
     return kept
 
 
-# ---------------------------
-# DÉTECTION DES 3 REPÈRES
-# ---------------------------
+# --------------------------------
+# DÉTECTION REPÈRES (ADAPTATIF)
+# --------------------------------
 def find_black_calibration_points(bgr_image):
-    """Détecte les 3 repères noirs extérieurs (ronds ou carrés)."""
+    """
+    Détecte les 3 repères noirs (ronds/carrés) même s'il y a des ombres,
+    grâce au seuillage adaptatif.
+    """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
+
+    # seuillage adaptatif pour éviter que la feuille ombrée soit prise comme noir
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        51,   # taille de la fenêtre
+        10    # constante soustraite
+    )
+
     kernel = np.ones((3, 3), np.uint8)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
@@ -65,7 +81,6 @@ def find_black_calibration_points(bgr_image):
 
 
 def order_calibration_points(calib_points):
-    """Ordonne les 3 repères : haut / bas-gauche / bas-droite."""
     if len(calib_points) < 3:
         return None
     pts = sorted(calib_points, key=lambda p: p[1])  # tri vertical
@@ -75,30 +90,71 @@ def order_calibration_points(calib_points):
         bottom_left, bottom_right = bottom1, bottom2
     else:
         bottom_left, bottom_right = bottom2, bottom1
-    return {"top": top, "bottom_left": bottom_left, "bottom_right": bottom_right}
+    return {
+        "top": top,
+        "bottom_left": bottom_left,
+        "bottom_right": bottom_right,
+    }
 
 
-def get_radar_center_and_radius_from_template(calib_struct, img_shape):
-    """Recalcule le centre et le rayon du radar à partir des 3 repères."""
-    if calib_struct is None:
-        h, w = img_shape[:2]
-        return (w // 2, h // 2), min(h, w) // 2
+# --------------------------------
+# FALLBACK : GRAND CERCLE (ADAPTATIF)
+# --------------------------------
+def find_outer_circle_quick(bgr_image):
+    """
+    Fallback : si la détection des 3 repères n'est pas exploitable,
+    on prend le plus gros contour (le radar) en seuillage adaptatif.
+    """
+    gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        51,
+        10
+    )
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    biggest = max(contours, key=cv2.contourArea)
+    (x, y), radius = cv2.minEnclosingCircle(biggest)
+    return (int(x), int(y), int(radius))
 
-    top = calib_struct["top"]
-    bl = calib_struct["bottom_left"]
-    br = calib_struct["bottom_right"]
 
-    bottom_y = int((bl[1] + br[1]) / 2)
-    center_x = int((bl[0] + br[0]) / 2)
-    center_y = int((top[1] + bottom_y) / 2)
-    radius = int((bottom_y - top[1]) / 2)
+def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct):
+    """
+    1) on essaie d'utiliser les 3 repères (scénario normal)
+    2) si les repères sont trop alignés (pas assez de delta Y) → fallback sur le cercle réel
+    """
+    h, w = img.shape[:2]
 
-    return (center_x, center_y), radius
+    if calib_struct is not None:
+        top = calib_struct["top"]
+        bl = calib_struct["bottom_left"]
+        br = calib_struct["bottom_right"]
+
+        bottom_y = int((bl[1] + br[1]) / 2)
+        vertical_spread = bottom_y - top[1]
+
+        if vertical_spread >= MIN_REPERE_VERTICAL_SPREAD:
+            center_x = int((bl[0] + br[0]) / 2)
+            center_y = int((top[1] + bottom_y) / 2)
+            radius = int(vertical_spread / 2)
+            return (center_x, center_y), radius
+
+    # fallback
+    oc = find_outer_circle_quick(img)
+    if oc is not None:
+        return (oc[0], oc[1]), oc[2]
+
+    # dernier recours
+    return image_center(img), min(h, w) // 2
 
 
-# ---------------------------
-# DÉTECTION DES POINTS ROUGES
-# ---------------------------
+# --------------------------------
+# POINTS ROUGES
+# --------------------------------
 def find_red_points(bgr_image,
                     min_area=MIN_RED_AREA_FALLBACK,
                     max_area=MAX_RED_AREA_FALLBACK):
@@ -125,17 +181,16 @@ def find_red_points(bgr_image,
         if h == 0:
             continue
         ratio = w / h
-        if ratio < 0.5 or ratio > 1.5:
-            continue
-        cx = int(x + w / 2)
-        cy = int(y + h / 2)
-        points.append((cx, cy, area_px))
+        if 0.5 <= ratio <= 1.5:
+            cx = int(x + w / 2)
+            cy = int(y + h / 2)
+            points.append((cx, cy, area_px))
     return points, mask
 
 
-# ---------------------------
-# CONSTRUCTION DU RÉSUMÉ
-# ---------------------------
+# --------------------------------
+# RÉSUMÉ
+# --------------------------------
 def build_resume(coups, centre_distance=None):
     if not coups:
         return {
@@ -178,12 +233,12 @@ def build_resume(coups, centre_distance=None):
     }
 
 
-# ---------------------------
-# ROUTES PRINCIPALES
-# ---------------------------
+# --------------------------------
+# ROUTES
+# --------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API – 3 repères extérieurs isolés", 200
+    return "Radar ToDoGolf API – 3 repères + fallback cercle + seuillage adaptatif", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -200,7 +255,6 @@ def analyze():
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
 
-    # 1m ou 5m par anneau
     calib_mode = request.form.get("calib_mode")
     if calib_mode == "circles":
         ring_step_m = 5.0
@@ -209,40 +263,54 @@ def analyze():
     else:
         ring_step_m = DEFAULT_RING_STEP_M
 
-    # --- Détection repères
+    # repères
     calib_points, _ = find_black_calibration_points(img)
-    calib_struct = order_calibration_points(calib_points)
-    radar_center, outer_radius_px = get_radar_center_and_radius_from_template(calib_struct, img.shape)
+    calib_struct = order_calibration_points(calib_points) if calib_points else None
 
-    # --- Points rouges
+    # centre + rayon (avec fallback si repères foireux)
+    radar_center, outer_radius_px = get_radar_center_and_radius_from_template_or_fallback(img, calib_struct)
+
+    # points rouges
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
-    # --- Conversion px → m
+    # échelle
     max_distance_m = ring_step_m * NB_RINGS
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
-    # --- Calcul des coups
+    # coups
     coups = []
     cx, cy = radar_center
     for (x, y, area) in shot_points:
         dx_px = x - cx
         lateral_m = round(dx_px * meters_per_px, 2)
 
-        r_point_px = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        r_point_px = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
         frac = r_point_px / float(outer_radius_px) if outer_radius_px > 0 else 0
         local_distance_m = round(frac * max_distance_m, 2)
 
-        distance_finale = (
-            round(centre_distance + local_distance_m, 2)
-            if centre_distance is not None
-            else local_distance_m
-        )
+        if centre_distance is not None:
+            distance_finale = round(centre_distance + local_distance_m, 2)
+        else:
+            distance_finale = local_distance_m
 
-        coups.append({"distance": distance_finale, "lateral_m": lateral_m})
+        coups.append({
+            "distance": distance_finale,
+            "lateral_m": lateral_m
+        })
 
-    # --- Résumé global
+    # résumé
     resume = build_resume(coups, centre_distance=centre_distance)
+
+    # debug : savoir si on est passé en fallback
+    used_fallback = True
+    if calib_struct is not None:
+        top = calib_struct["top"]
+        bl = calib_struct["bottom_left"]
+        br = calib_struct["bottom_right"]
+        bottom_y = int((bl[1] + br[1]) / 2)
+        vertical_spread = bottom_y - top[1]
+        used_fallback = vertical_spread < MIN_REPERE_VERTICAL_SPREAD
 
     return jsonify({
         "club": club,
@@ -252,18 +320,14 @@ def analyze():
         "coups": coups,
         "debug": {
             "nb_points_calib": len(calib_points),
-            "origin_px": list(radar_center),
-            "outer_radius_px": outer_radius_px,
-            "ring_step_m": ring_step_m,
-            "max_distance_m": max_distance_m,
-            "meters_per_px": meters_per_px,
+            "origin_px": [float(radar_center[0]), float(radar_center[1])],
+            "outer_radius_px": float(outer_radius_px),
+            "used_fallback": used_fallback,
+            "calib_points": calib_points,
         }
     })
 
 
-# ---------------------------
-# VISUALISATION /MASK
-# ---------------------------
 @app.route("/mask", methods=["POST"])
 def mask_route():
     if "image" not in request.files:
@@ -275,8 +339,8 @@ def mask_route():
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
     calib_points, _ = find_black_calibration_points(img)
-    calib_struct = order_calibration_points(calib_points)
-    radar_center, outer_radius_px = get_radar_center_and_radius_from_template(calib_struct, img.shape)
+    calib_struct = order_calibration_points(calib_points) if calib_points else None
+    radar_center, outer_radius_px = get_radar_center_and_radius_from_template_or_fallback(img, calib_struct)
 
     shot_points, red_mask = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
@@ -284,19 +348,19 @@ def mask_route():
     overlay = img.copy()
     overlay[red_mask > 0] = (0, 0, 255)
 
-    # Cercle principal
-    cv2.circle(overlay, radar_center, outer_radius_px, (255, 0, 255), 2)
+    # cercle principal
+    cv2.circle(overlay, (int(radar_center[0]), int(radar_center[1])), int(outer_radius_px), (255, 0, 255), 2)
 
-    # Cercles intermédiaires (1m / 5m)
+    # cercles intermédiaires
     for i in range(1, NB_RINGS):
         r = int(outer_radius_px * (i / NB_RINGS))
-        cv2.circle(overlay, radar_center, r, (0, 255, 255), 1)
+        cv2.circle(overlay, (int(radar_center[0]), int(radar_center[1])), r, (0, 255, 255), 1)
 
-    # Repères
+    # repères détectés
     for (x, y, area) in calib_points:
-        cv2.circle(overlay, (x, y), 5, (255, 255, 0), 2)
+        cv2.circle(overlay, (int(x), int(y)), 6, (255, 255, 0), 2)
 
-    # Points rouges
+    # impacts
     for (x, y, area) in shot_points:
         cv2.circle(overlay, (x, y), 4, (0, 255, 0), 2)
 
@@ -306,9 +370,9 @@ def mask_route():
     return send_file(tmpfile.name, mimetype="image/png")
 
 
-# ---------------------------
+# --------------------------------
 # PAGES DE TEST
-# ---------------------------
+# --------------------------------
 @app.route("/test")
 def test_page():
     return """
@@ -360,9 +424,6 @@ def test_mask_page():
     """
 
 
-# ---------------------------
-# LANCEMENT SERVEUR
-# ---------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
