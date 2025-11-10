@@ -33,7 +33,7 @@ def circle_from_3_points(p1, p2, p3):
 
     temp = x2**2 + y2**2
     bc = (x1**2 + y1**2 - temp) / 2.0
-    cd = (temp - x3**2 - y3**2) / 2.0
+    cd = (temp - (x3**2 + y3**2)) / 2.0
     det = (x1 - x2) * (y2 - y3) - (x2 - x3) * (y1 - y2)
 
     if abs(det) < 1e-6:
@@ -399,3 +399,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
