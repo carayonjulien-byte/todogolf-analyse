@@ -3,6 +3,7 @@ import tempfile
 from flask import Flask, request, jsonify, send_file
 import cv2
 import numpy as np
+import math
 
 app = Flask(__name__)
 
@@ -12,7 +13,7 @@ app = Flask(__name__)
 MIN_RED_AREA_FALLBACK = 100
 MAX_RED_AREA_FALLBACK = 5000
 DEFAULT_RING_STEP_M = 5.0  # si pas de mode précisé
-NB_RINGS = 4               # tu as dit : toujours 4 cercles
+NB_RINGS = 4               # toujours 4 cercles
 
 
 # ---------------------------
@@ -20,9 +21,9 @@ NB_RINGS = 4               # tu as dit : toujours 4 cercles
 # ---------------------------
 def circle_from_3_points(p1, p2, p3):
     """Renvoie (cx, cy, r) du cercle passant par 3 points."""
-    x1, y1 = p1[0], p1[1]
-    x2, y2 = p2[0], p2[1]
-    x3, y3 = p3[0], p3[1]
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
 
     temp = x2**2 + y2**2
     bc = (x1**2 + y1**2 - temp) / 2.0
@@ -30,12 +31,12 @@ def circle_from_3_points(p1, p2, p3):
     det = (x1 - x2) * (y2 - y3) - (x2 - x3) * (y1 - y2)
 
     if abs(det) < 1e-6:
-        return None  # points quasi alignés
+        return None
 
     cx = (bc * (y2 - y3) - cd * (y1 - y2)) / det
     cy = ((x1 - x2) * cd - (x2 - x3) * bc) / det
-    r = np.sqrt((cx - x1) ** 2 + (cy - y1) ** 2)
-    return (int(cx), int(cy), int(r))
+    r = math.sqrt((cx - x1)**2 + (cy - y1)**2)
+    return (cx, cy, r)  # on garde les floats
 
 
 def keep_points_in_circle(points, center, radius_px):
@@ -53,7 +54,10 @@ def keep_points_in_circle(points, center, radius_px):
 # DÉTECTIONS
 # ---------------------------
 def find_black_calibration_points(bgr_image):
-    """Détecte les 3 plus gros ronds noirs posés sur le cercle extérieur."""
+    """
+    Détecte les 3 repères noirs.
+    On filtre par aire pour ignorer le gros cercle du radar.
+    """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
     kernel = np.ones((3, 3), np.uint8)
@@ -63,25 +67,27 @@ def find_black_calibration_points(bgr_image):
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area < 50:
+        # 👇 ces bornes sont importantes :
+        # - >50 : on vire le bruit
+        # - <2000 : on vire le gros cercle
+        if area < 50 or area > 2000:
             continue
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
+        cx = float(M["m10"] / M["m00"])
+        cy = float(M["m01"] / M["m00"])
         candidates.append((cx, cy, area))
 
+    # on veut exactement les 3 plus gros "petits" ronds
     candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
     return candidates[:3], thresh
 
 
 def order_calibration_points(calib_points):
-    """on veut juste les 3 dans un dict lisible."""
+    """On retourne juste un dict avec 3 points nommés."""
     if len(calib_points) < 3:
         return None
-    # on ne force pas top/bottom ici puisque tous sont sur le cercle, mais on range
-    # on garde juste comme ça
     return {
         "p1": calib_points[0],
         "p2": calib_points[1],
@@ -189,7 +195,6 @@ def analyze():
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
 
-    # 1m ou 5m
     calib_mode = request.form.get("calib_mode")
     if calib_mode == "circles":
         ring_step_m = 5.0
@@ -198,46 +203,42 @@ def analyze():
     else:
         ring_step_m = DEFAULT_RING_STEP_M
 
-    # 1. points de calibration
+    # 1. repères
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
-
     if calib_struct is None:
-        return jsonify({"error": "Impossible de trouver les 3 repères noirs"}), 400
+        return jsonify({"error": "3 repères noirs non détectés"}), 400
 
-    # 2. cercle radar à partir des 3 repères (scénario B)
+    # 2. cercle radar
     p1 = (calib_struct["p1"][0], calib_struct["p1"][1])
     p2 = (calib_struct["p2"][0], calib_struct["p2"][1])
     p3 = (calib_struct["p3"][0], calib_struct["p3"][1])
     circle = circle_from_3_points(p1, p2, p3)
     if circle is None:
-        return jsonify({"error": "Les 3 repères sont trop alignés"}), 400
+        return jsonify({"error": "repères trop alignés"}), 400
 
     radar_center = (circle[0], circle[1])
     outer_radius_px = circle[2]
 
-    # 3. points rouges
+    # 3. impacts
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
     # 4. échelle
-    max_distance_m = ring_step_m * NB_RINGS  # 4x1 ou 4x5
+    max_distance_m = ring_step_m * NB_RINGS
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
-    # 5. calcul des coups
+    # 5. coups
     coups = []
     cx, cy = radar_center
     for (x, y, area) in shot_points:
-        # latéral
         dx_px = x - cx
         lateral_m = round(dx_px * meters_per_px, 2)
 
-        # distance locale selon rayon
-        r_point_px = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        r_point_px = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
         frac = r_point_px / float(outer_radius_px) if outer_radius_px > 0 else 0
         local_distance_m = round(frac * max_distance_m, 2)
 
-        # distance finale
         if centre_distance is not None:
             distance_finale = round(centre_distance + local_distance_m, 2)
         else:
@@ -248,7 +249,6 @@ def analyze():
             "lateral_m": lateral_m
         })
 
-    # 6. résumé
     resume = build_resume(coups, centre_distance=centre_distance)
 
     return jsonify({
@@ -259,8 +259,8 @@ def analyze():
         "coups": coups,
         "debug": {
             "nb_points_calib": len(calib_points),
-            "origin_px": list(radar_center),
-            "outer_radius_px": outer_radius_px,
+            "origin_px": [circle[0], circle[1]],
+            "outer_radius_px": circle[2],
             "ring_step_m": ring_step_m,
             "max_distance_m": max_distance_m,
             "meters_per_px": meters_per_px,
@@ -278,19 +278,17 @@ def mask_route():
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
-    # calib
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points)
-
     if calib_struct is None:
-        return jsonify({"error": "Impossible de trouver les 3 repères noirs"}), 400
+        return jsonify({"error": "3 repères noirs non détectés"}), 400
 
     p1 = (calib_struct["p1"][0], calib_struct["p1"][1])
     p2 = (calib_struct["p2"][0], calib_struct["p2"][1])
     p3 = (calib_struct["p3"][0], calib_struct["p3"][1])
     circle = circle_from_3_points(p1, p2, p3)
     if circle is None:
-        return jsonify({"error": "Les 3 repères sont trop alignés"}), 400
+        return jsonify({"error": "repères trop alignés"}), 400
 
     radar_center = (circle[0], circle[1])
     outer_radius_px = circle[2]
@@ -302,19 +300,31 @@ def mask_route():
     overlay = img.copy()
     overlay[red_mask > 0] = (0, 0, 255)
 
-    # cercle principal
-    cv2.circle(overlay, radar_center, outer_radius_px, (255, 0, 255), 2)
+    # cercle principal (on arrondit seulement au moment de dessiner)
+    cv2.circle(
+        overlay,
+        (int(round(radar_center[0])), int(round(radar_center[1]))),
+        int(round(outer_radius_px)),
+        (255, 0, 255),
+        2
+    )
 
     # cercles intermédiaires
     for i in range(1, NB_RINGS):
-        r = int(outer_radius_px * (i / NB_RINGS))
-        cv2.circle(overlay, radar_center, r, (0, 255, 255), 1)
+        r = int(round(outer_radius_px * (i / NB_RINGS)))
+        cv2.circle(
+            overlay,
+            (int(round(radar_center[0])), int(round(radar_center[1]))),
+            r,
+            (0, 255, 255),
+            1
+        )
 
-    # points calib
+    # repères (pour vérif)
     for (x, y, area) in calib_points:
-        cv2.circle(overlay, (x, y), 5, (255, 255, 0), 2)
+        cv2.circle(overlay, (int(x), int(y)), 6, (0, 255, 255), 2)
 
-    # points rouges
+    # impacts
     for (x, y, area) in shot_points:
         cv2.circle(overlay, (x, y), 4, (0, 255, 0), 2)
 
@@ -325,7 +335,7 @@ def mask_route():
 
 
 # ---------------------------
-# ROUTES DE TEST
+# TEST PAGES
 # ---------------------------
 @app.route("/test")
 def test_page():
