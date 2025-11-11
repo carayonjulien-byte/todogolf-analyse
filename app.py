@@ -393,19 +393,31 @@ def analyze():
 
     coups = []
     cx, cy = radar_center
+    meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
+    
     for (x, y, area) in shot_points:
-        dx_px = x - cx
-        lateral_m = round(dx_px * meters_per_px, 2)
-        r_point_px = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-        frac = r_point_px / float(outer_radius_px) if outer_radius_px > 0 else 0
-        local_distance_m = round(frac * max_distance_m, 2)
+        # --- décalages en pixels ---
+        dx_px = x - cx       # droite/gauche
+        dy_px = y - cy       # haut/bas
+    
+        # --- conversions en mètres ---
+        ecart_lateral_m = round(dx_px * meters_per_px, 2)
+        ecart_profondeur_m = round(-dy_px * meters_per_px, 2)  # inversé : vers le haut = long
+    
+        # --- distance radiale (Pythagore) ---
+        distance_ecart_m = math.sqrt(dx_px**2 + dy_px**2) * meters_per_px
+    
+        # --- distance totale du coup ---
         if centre_distance is not None:
-            distance_finale = round(centre_distance + local_distance_m, 2)
+            distance_totale_m = round(centre_distance + distance_ecart_m, 2)
         else:
-            distance_finale = local_distance_m
+            distance_totale_m = round(distance_ecart_m, 2)
+    
+        # --- enregistrement brut ---
         coups.append({
-            "distance": distance_finale,
-            "lateral_m": lateral_m
+            "distance_totale_m": distance_totale_m,
+            "ecart_lateral_m": ecart_lateral_m,
+            "ecart_profondeur_m": ecart_profondeur_m
         })
 
     resume = build_resume(coups, centre_distance=centre_distance)
@@ -531,6 +543,7 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
