@@ -67,6 +67,9 @@ def keep_points_in_circle(points, center, radius_px):
 # DÉTECTION DES REPÈRES
 # --------------------------------
 def find_black_calibration_points(bgr_image):
+    """
+    Détecte les 3 repères (ronds ou carrés) en ignorant les impacts rouges.
+    """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     thresh = cv2.adaptiveThreshold(
         gray,
@@ -80,17 +83,12 @@ def find_black_calibration_points(bgr_image):
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < CALIB_MIN_AREA or area > CALIB_MAX_AREA:
-            continue
-
-        per = cv2.arcLength(c, True)
-        if per == 0:
-            continue
-        circularity = 4 * np.pi * (area / (per * per))
-        if circularity < 0.5:
             continue
 
         M = cv2.moments(c)
@@ -99,11 +97,26 @@ def find_black_calibration_points(bgr_image):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
+        # on vire les trucs rouges
+        h, s, v = hsv[cy, cx]
+        is_red = (
+            (0 <= h <= 15 and s > 60 and v > 40) or
+            (165 <= h <= 179 and s > 60 and v > 40)
+        )
+        if is_red:
+            continue
+
+        per = cv2.arcLength(c, True)
+        if per == 0:
+            continue
+        circularity = 4 * np.pi * (area / (per * per))
+        if circularity < 0.45:
+            continue
+
         candidates.append((cx, cy, int(area)))
 
     candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
     return candidates[:3], thresh
-
 
 def order_calibration_points(calib_points):
     if len(calib_points) < 3:
@@ -190,20 +203,21 @@ def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct, cal
 def guess_ring_step_from_calib(img, calib_points):
     """
     Devine l'échelle à partir de la forme des repères détectés.
-    - repères plutôt ronds  -> 5 m
-    - repères plutôt carrés -> 1 m
-    Si on ne peut pas deviner, on garde DEFAULT_RING_STEP_M.
+    On regarde le nombre de côtés du contour associé à chaque repère :
+    - majorité de 4 côtés -> carrés -> 1 m
+    - sinon -> ronds -> 5 m
     """
     if not calib_points or len(calib_points) < 3:
         return DEFAULT_RING_STEP_M, "default"
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # même logique simple que tout à l'heure
+    # même seuillage simple que tout à l'heure
     _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    circ_values = []
-    ratio_values = []
+    square_count = 0
+    circle_like_count = 0
+    matched = 0
 
     for c in contours:
         area = cv2.contourArea(c)
@@ -216,33 +230,34 @@ def guess_ring_step_from_calib(img, calib_points):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # est-ce que ce contour correspond à un des 3 repères ?
+        # on vérifie que ce contour correspond à un des 3 repères trouvés
+        is_calib = False
         for (px, py, _) in calib_points:
-            if (px - cx) ** 2 + (py - cy) ** 2 < 25**2:  # tolérance 25px
-                per = cv2.arcLength(c, True)
-                if per == 0:
-                    continue
-                circularity = 4 * np.pi * (area / (per * per))
-                circ_values.append(circularity)
-
-                x, y, w, h = cv2.boundingRect(c)
-                if h != 0:
-                    ratio_values.append(w / h)
+            if (px - cx) ** 2 + (py - cy) ** 2 < 25**2:
+                is_calib = True
                 break
+        if not is_calib:
+            continue
 
-    if not circ_values:
+        matched += 1
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.04 * peri, True)  # 4% du périmètre
+        sides = len(approx)
+
+        if sides == 4:
+            square_count += 1
+        else:
+            # tout ce qui n'est pas carré, on le range dans "rond-ish"
+            circle_like_count += 1
+
+    if matched == 0:
         return DEFAULT_RING_STEP_M, "no-match"
 
-    mean_circ = float(np.mean(circ_values))
-    mean_ratio = float(np.mean(ratio_values)) if ratio_values else 1.0
-
-    # on abaisse le seuil de "rond" pour tolérer l'impression / scan
-    # - si circularité >= 0.7 et le ratio est proche de 1 -> on dit "rond" => 5 m
-    if mean_circ >= 0.7 and 0.8 <= mean_ratio <= 1.25:
-        return 5.0, f"round(circ={mean_circ:.2f},ratio={mean_ratio:.2f})"
+    # règle simple : si au moins 2 repères sont carrés -> 1 m, sinon 5 m
+    if square_count >= 2:
+        return 1.0, f"square({square_count}/3)"
     else:
-        return 1.0, f"square(circ={mean_circ:.2f},ratio={mean_ratio:.2f})"
-
+        return 5.0, f"round({circle_like_count}/3)"
 
 # --------------------------------
 # POINTS ROUGES
@@ -344,6 +359,13 @@ def analyze():
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
+    # réduction éventuelle de l'image (optionnel mais tu l'as ajouté)
+    MAX_SIDE = 1600
+    h, w = img.shape[:2]
+    if max(h, w) > MAX_SIDE:
+        scale = MAX_SIDE / float(max(h, w))
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
     club = request.form.get("club", "Inconnu")
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
@@ -359,51 +381,58 @@ def analyze():
         calib_points
     )
 
-    # 3) échelle auto (1 m ou 5 m) à partir de la forme des repères
+    # 3) deviner 1 m ou 5 m
     ring_step_m, ring_reason = guess_ring_step_from_calib(img, calib_points)
+    # distance max que représente le grand cercle
+    max_distance_m = ring_step_m * NB_RINGS
 
     # 4) points rouges
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
-    # 5) px -> m (là seulement on utilise 1m/5m)
-    max_distance_m = ring_step_m * NB_RINGS
+    # 5) conversions
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
+    # 6) fabrication des coups (version “brute” que tu veux)
     coups = []
     cx, cy = radar_center
     for (x, y, area) in shot_points:
-        dx_px = x - cx
-        lateral_m = round(dx_px * meters_per_px, 2)
-        r_point_px = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-        frac = r_point_px / float(outer_radius_px) if outer_radius_px > 0 else 0
-        local_distance_m = round(frac * max_distance_m, 2)
-        if centre_distance is not None:
-            distance_finale = round(centre_distance + local_distance_m, 2)
-        else:
-            distance_finale = local_distance_m
-        coups.append({
-            "distance": distance_finale,
-            "lateral_m": lateral_m
-        })
+        # décalage en px
+        dx_px = x - cx           # droite / gauche
+        dy_px = y - cy           # bas / haut (y augmente vers le bas)
 
-    resume = build_resume(coups, centre_distance=centre_distance)
+        # en mètres
+        ecart_lateral_m = round(dx_px * meters_per_px, 2)
+        # on inverse le signe pour que “vers le haut” = positif = plus long
+        ecart_profondeur_m = round(-dy_px * meters_per_px, 2)
+
+        # distance radiale (Pythagore) pour la distance totale
+        distance_ecart_m = math.sqrt(dx_px**2 + dy_px**2) * meters_per_px
+
+        if centre_distance is not None:
+            distance_totale_m = round(centre_distance + distance_ecart_m, 2)
+        else:
+            distance_totale_m = round(distance_ecart_m, 2)
+
+        coups.append({
+            "distance_totale_m": distance_totale_m,
+            "ecart_lateral_m": ecart_lateral_m,
+            "ecart_profondeur_m": ecart_profondeur_m
+        })
 
     return jsonify({
         "club": club,
         "centre_distance": centre_distance,
         "nb_coups": len(coups),
-        "resume": resume,
         "coups": coups,
         "debug": {
             "nb_points_calib": len(calib_points),
             "origin_px": [float(radar_center[0]), float(radar_center[1])],
             "outer_radius_px": float(outer_radius_px),
-            "used_3pt_circle": used_3pt_circle,
             "circle_reason": circle_reason,
-            "calib_points": calib_points,
             "ring_step_m": ring_step_m,
             "ring_reason": ring_reason,
+            "calib_points": calib_points,
         }
     })
 
@@ -417,6 +446,12 @@ def mask_route():
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
+
+    MAX_SIDE = 1600
+    h, w = img.shape[:2]
+    if max(h, w) > MAX_SIDE:
+        scale = MAX_SIDE / float(max(h, w))
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points) if calib_points else None
@@ -504,4 +539,11 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
+
+
+
+
+
+
 
