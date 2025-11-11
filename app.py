@@ -393,32 +393,43 @@ def analyze():
     # 5) conversions
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
-    # 6) fabrication des coups (version “brute” que tu veux)
+    # 6) fabrication des coups (version recalcul Pythagore + arrondi)
     coups = []
     cx, cy = radar_center
+    centre_for_calc = float(centre_distance or 0)
+
     for (x, y, area) in shot_points:
         # décalage en px
         dx_px = x - cx           # droite / gauche
         dy_px = y - cy           # bas / haut (y augmente vers le bas)
 
         # en mètres
-        ecart_lateral_m = round(dx_px * meters_per_px, 2)
+        ecart_lateral_m = dx_px * meters_per_px
         # on inverse le signe pour que “vers le haut” = positif = plus long
-        ecart_profondeur_m = round(-dy_px * meters_per_px, 2)
+        ecart_profondeur_m = -dy_px * meters_per_px
 
-        # distance radiale (Pythagore) pour la distance totale
-        distance_ecart_m = math.sqrt(dx_px**2 + dy_px**2) * meters_per_px
+        # ---------- NOUVELLE LOGIQUE ----------
+        # 1) distance dans l’axe = distance cible + profondeur (long/court)
+        distance_dans_laxe_m = centre_for_calc + ecart_profondeur_m
 
-        if centre_distance is not None:
-            distance_totale_m = round(centre_distance + distance_ecart_m, 2)
-        else:
-            distance_totale_m = round(distance_ecart_m, 2)
+        # 2) Pythagore en mètres : distance réelle depuis l’origine
+        distance_totale_m = math.sqrt(distance_dans_laxe_m ** 2 + ecart_lateral_m ** 2)
+
+        # 3) arrondi au 0,5 m
+        distance_totale_m = round(distance_totale_m * 2) / 2
+
+        # 4) formatage à 1 décimale partout
+        distance_totale_m = float(f"{distance_totale_m:.1f}")
+        ecart_lateral_m = float(f"{ecart_lateral_m:.1f}")
+        ecart_profondeur_m = float(f"{ecart_profondeur_m:.1f}")
+        # --------------------------------------
 
         coups.append({
             "distance_totale_m": distance_totale_m,
             "ecart_lateral_m": ecart_lateral_m,
             "ecart_profondeur_m": ecart_profondeur_m
         })
+
 
     return jsonify({
         "club": club,
@@ -539,6 +550,7 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
