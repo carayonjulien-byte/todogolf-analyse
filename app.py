@@ -359,12 +359,13 @@ def analyze():
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
+    # réduction éventuelle de l'image (optionnel mais tu l'as ajouté)
     MAX_SIDE = 1600
     h, w = img.shape[:2]
     if max(h, w) > MAX_SIDE:
         scale = MAX_SIDE / float(max(h, w))
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    
+
     club = request.form.get("club", "Inconnu")
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
@@ -380,63 +381,58 @@ def analyze():
         calib_points
     )
 
-    # 3) échelle auto (1 m ou 5 m) à partir de la forme des repères
+    # 3) deviner 1 m ou 5 m
     ring_step_m, ring_reason = guess_ring_step_from_calib(img, calib_points)
+    # distance max que représente le grand cercle
+    max_distance_m = ring_step_m * NB_RINGS
 
     # 4) points rouges
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
-    # 5) px -> m (là seulement on utilise 1m/5m)
-    max_distance_m = ring_step_m * NB_RINGS
+    # 5) conversions
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
+    # 6) fabrication des coups (version “brute” que tu veux)
     coups = []
     cx, cy = radar_center
-    meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
-    
     for (x, y, area) in shot_points:
-        # --- décalages en pixels ---
-        dx_px = x - cx       # droite/gauche
-        dy_px = y - cy       # haut/bas
-    
-        # --- conversions en mètres ---
+        # décalage en px
+        dx_px = x - cx           # droite / gauche
+        dy_px = y - cy           # bas / haut (y augmente vers le bas)
+
+        # en mètres
         ecart_lateral_m = round(dx_px * meters_per_px, 2)
-        ecart_profondeur_m = round(-dy_px * meters_per_px, 2)  # inversé : vers le haut = long
-    
-        # --- distance radiale (Pythagore) ---
+        # on inverse le signe pour que “vers le haut” = positif = plus long
+        ecart_profondeur_m = round(-dy_px * meters_per_px, 2)
+
+        # distance radiale (Pythagore) pour la distance totale
         distance_ecart_m = math.sqrt(dx_px**2 + dy_px**2) * meters_per_px
-    
-        # --- distance totale du coup ---
+
         if centre_distance is not None:
             distance_totale_m = round(centre_distance + distance_ecart_m, 2)
         else:
             distance_totale_m = round(distance_ecart_m, 2)
-    
-        # --- enregistrement brut ---
+
         coups.append({
             "distance_totale_m": distance_totale_m,
             "ecart_lateral_m": ecart_lateral_m,
             "ecart_profondeur_m": ecart_profondeur_m
         })
 
-    resume = build_resume(coups, centre_distance=centre_distance)
-
     return jsonify({
         "club": club,
         "centre_distance": centre_distance,
         "nb_coups": len(coups),
-        "resume": resume,
         "coups": coups,
         "debug": {
             "nb_points_calib": len(calib_points),
             "origin_px": [float(radar_center[0]), float(radar_center[1])],
             "outer_radius_px": float(outer_radius_px),
-            "used_3pt_circle": used_3pt_circle,
             "circle_reason": circle_reason,
-            "calib_points": calib_points,
             "ring_step_m": ring_step_m,
             "ring_reason": ring_reason,
+            "calib_points": calib_points,
         }
     })
 
@@ -543,6 +539,7 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
