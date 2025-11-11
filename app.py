@@ -190,20 +190,21 @@ def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct, cal
 def guess_ring_step_from_calib(img, calib_points):
     """
     Devine l'échelle à partir de la forme des repères détectés.
-    - repères plutôt ronds  -> 5 m
-    - repères plutôt carrés -> 1 m
-    Si on ne peut pas deviner, on garde DEFAULT_RING_STEP_M.
+    On regarde le nombre de côtés du contour associé à chaque repère :
+    - majorité de 4 côtés -> carrés -> 1 m
+    - sinon -> ronds -> 5 m
     """
     if not calib_points or len(calib_points) < 3:
         return DEFAULT_RING_STEP_M, "default"
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # même logique simple que tout à l'heure
+    # même seuillage simple que tout à l'heure
     _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    circ_values = []
-    ratio_values = []
+    square_count = 0
+    circle_like_count = 0
+    matched = 0
 
     for c in contours:
         area = cv2.contourArea(c)
@@ -216,33 +217,34 @@ def guess_ring_step_from_calib(img, calib_points):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # est-ce que ce contour correspond à un des 3 repères ?
+        # on vérifie que ce contour correspond à un des 3 repères trouvés
+        is_calib = False
         for (px, py, _) in calib_points:
-            if (px - cx) ** 2 + (py - cy) ** 2 < 25**2:  # tolérance 25px
-                per = cv2.arcLength(c, True)
-                if per == 0:
-                    continue
-                circularity = 4 * np.pi * (area / (per * per))
-                circ_values.append(circularity)
-
-                x, y, w, h = cv2.boundingRect(c)
-                if h != 0:
-                    ratio_values.append(w / h)
+            if (px - cx) ** 2 + (py - cy) ** 2 < 25**2:
+                is_calib = True
                 break
+        if not is_calib:
+            continue
 
-    if not circ_values:
+        matched += 1
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.04 * peri, True)  # 4% du périmètre
+        sides = len(approx)
+
+        if sides == 4:
+            square_count += 1
+        else:
+            # tout ce qui n'est pas carré, on le range dans "rond-ish"
+            circle_like_count += 1
+
+    if matched == 0:
         return DEFAULT_RING_STEP_M, "no-match"
 
-    mean_circ = float(np.mean(circ_values))
-    mean_ratio = float(np.mean(ratio_values)) if ratio_values else 1.0
-
-    # on abaisse le seuil de "rond" pour tolérer l'impression / scan
-    # - si circularité >= 0.7 et le ratio est proche de 1 -> on dit "rond" => 5 m
-    if mean_circ >= 0.7 and 0.8 <= mean_ratio <= 1.25:
-        return 5.0, f"round(circ={mean_circ:.2f},ratio={mean_ratio:.2f})"
+    # règle simple : si au moins 2 repères sont carrés -> 1 m, sinon 5 m
+    if square_count >= 2:
+        return 1.0, f"square({square_count}/3)"
     else:
-        return 1.0, f"square(circ={mean_circ:.2f},ratio={mean_ratio:.2f})"
-
+        return 5.0, f"round({circle_like_count}/3)"
 
 # --------------------------------
 # POINTS ROUGES
@@ -504,3 +506,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
