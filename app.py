@@ -185,6 +185,66 @@ def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct, cal
 
 
 # --------------------------------
+# AUTO ÉCHELLE (1 m ou 5 m) — AJOUT
+# --------------------------------
+def guess_ring_step_from_calib(img, calib_points):
+    """
+    Devine l'échelle à partir de la forme des repères détectés.
+    - repères plutôt ronds  -> 5 m
+    - repères plutôt carrés -> 1 m
+    Si on ne peut pas deviner, on garde DEFAULT_RING_STEP_M.
+    """
+    if not calib_points or len(calib_points) < 3:
+        return DEFAULT_RING_STEP_M, "default"
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # même logique simple que tout à l'heure
+    _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    circ_values = []
+    ratio_values = []
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < CALIB_MIN_AREA or area > CALIB_MAX_AREA:
+            continue
+
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+
+        # est-ce que ce contour correspond à un des 3 repères ?
+        for (px, py, _) in calib_points:
+            if (px - cx) ** 2 + (py - cy) ** 2 < 25**2:  # tolérance 25px
+                per = cv2.arcLength(c, True)
+                if per == 0:
+                    continue
+                circularity = 4 * np.pi * (area / (per * per))
+                circ_values.append(circularity)
+
+                x, y, w, h = cv2.boundingRect(c)
+                if h != 0:
+                    ratio_values.append(w / h)
+                break
+
+    if not circ_values:
+        return DEFAULT_RING_STEP_M, "no-match"
+
+    mean_circ = float(np.mean(circ_values))
+    mean_ratio = float(np.mean(ratio_values)) if ratio_values else 1.0
+
+    # on abaisse le seuil de "rond" pour tolérer l'impression / scan
+    # - si circularité >= 0.7 et le ratio est proche de 1 -> on dit "rond" => 5 m
+    if mean_circ >= 0.7 and 0.8 <= mean_ratio <= 1.25:
+        return 5.0, f"round(circ={mean_circ:.2f},ratio={mean_ratio:.2f})"
+    else:
+        return 1.0, f"square(circ={mean_circ:.2f},ratio={mean_ratio:.2f})"
+
+
+# --------------------------------
 # POINTS ROUGES
 # --------------------------------
 def find_red_points(bgr_image,
@@ -288,26 +348,25 @@ def analyze():
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
 
-    calib_mode = request.form.get("calib_mode")
-    if calib_mode == "circles":
-        ring_step_m = 5.0
-    elif calib_mode == "squares":
-        ring_step_m = 1.0
-    else:
-        ring_step_m = DEFAULT_RING_STEP_M
-
+    # 1) repères
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points) if calib_points else None
 
+    # 2) centre + rayon
     radar_center, outer_radius_px, used_3pt_circle, circle_reason = get_radar_center_and_radius_from_template_or_fallback(
         img,
         calib_struct,
         calib_points
     )
 
+    # 3) échelle auto (1 m ou 5 m) à partir de la forme des repères
+    ring_step_m, ring_reason = guess_ring_step_from_calib(img, calib_points)
+
+    # 4) points rouges
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
+    # 5) px -> m (là seulement on utilise 1m/5m)
     max_distance_m = ring_step_m * NB_RINGS
     meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
@@ -343,6 +402,8 @@ def analyze():
             "used_3pt_circle": used_3pt_circle,
             "circle_reason": circle_reason,
             "calib_points": calib_points,
+            "ring_step_m": ring_step_m,
+            "ring_reason": ring_reason,
         }
     })
 
@@ -405,13 +466,6 @@ def test_page():
       <p><input type="file" name="image" required></p>
       <p><input type="text" name="club" placeholder="Ex: Fer7"></p>
       <p><input type="number" step="0.1" name="centre_distance" placeholder="Ex: 100"></p>
-      <p>
-        <select name="calib_mode">
-          <option value="">(défaut 5 m)</option>
-          <option value="circles">cercles (5 m)</option>
-          <option value="squares">carrés (1 m)</option>
-        </select>
-      </p>
       <button type="submit">Analyser</button>
     </form>
     </body></html>
@@ -450,3 +504,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
