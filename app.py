@@ -68,25 +68,9 @@ def keep_points_in_circle(points, center, radius_px):
 # --------------------------------
 def find_black_calibration_points(bgr_image):
     """
-    Détecte les 3 repères (ronds ou carrés) en ignorant les éléments rouges (impacts).
-    On masque d'abord le rouge, puis on cherche les formes sombres.
+    Détecte les 3 repères (ronds ou carrés) en ignorant les impacts rouges.
     """
-    # 1) on masque le rouge
-    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-    lower_red_1 = np.array([0, 70, 50])
-    upper_red_1 = np.array([15, 255, 255])
-    lower_red_2 = np.array([165, 70, 50])
-    upper_red_2 = np.array([179, 255, 255])
-    mask_red_1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
-    mask_red_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
-    mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
-
-    # on travaille en niveaux de gris mais on enlève les zones rouges
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
-    # les pixels rouges → on les met en blanc pour qu'ils ne soient pas pris pour des repères
-    gray[mask_red > 0] = 255
-
-    # 2) seuillage adaptatif comme avant
     thresh = cv2.adaptiveThreshold(
         gray,
         255,
@@ -97,20 +81,14 @@ def find_black_calibration_points(bgr_image):
     )
     kernel = np.ones((3, 3), np.uint8)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < CALIB_MIN_AREA or area > CALIB_MAX_AREA:
-            continue
-
-        per = cv2.arcLength(c, True)
-        if per == 0:
-            continue
-        circularity = 4 * np.pi * (area / (per * per))
-        if circularity < 0.45:  # tolérant pour les carrés imprimés
             continue
 
         M = cv2.moments(c)
@@ -119,11 +97,26 @@ def find_black_calibration_points(bgr_image):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
+        # on vire les trucs rouges
+        h, s, v = hsv[cy, cx]
+        is_red = (
+            (0 <= h <= 15 and s > 60 and v > 40) or
+            (165 <= h <= 179 and s > 60 and v > 40)
+        )
+        if is_red:
+            continue
+
+        per = cv2.arcLength(c, True)
+        if per == 0:
+            continue
+        circularity = 4 * np.pi * (area / (per * per))
+        if circularity < 0.45:
+            continue
+
         candidates.append((cx, cy, int(area)))
 
     candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
     return candidates[:3], thresh
-
 
 def order_calibration_points(calib_points):
     if len(calib_points) < 3:
@@ -366,6 +359,12 @@ def analyze():
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
+    MAX_SIDE = 1600  # 1200 si tu veux encore plus rapide
+    h, w = img.shape[:2]
+    if max(h, w) > MAX_SIDE:
+    scale = MAX_SIDE / float(max(h, w))
+    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    
     club = request.form.get("club", "Inconnu")
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
@@ -439,6 +438,12 @@ def mask_route():
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
+
+    MAX_SIDE = 1600
+    h, w = img.shape[:2]
+    if max(h, w) > MAX_SIDE:
+    scale = MAX_SIDE / float(max(h, w))
+    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points) if calib_points else None
@@ -526,5 +531,6 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
 
