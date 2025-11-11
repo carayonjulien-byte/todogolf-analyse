@@ -396,7 +396,7 @@ def analyze():
     MAX_PROFONDEUR_PX = outer_radius_px  # on prend le rayon comme "loin"
     METRES_PAR_PIXEL_Y_NEAR = meters_per_px_base
     # on augmente un peu la profondeur pour les points éloignés
-    METRES_PAR_PIXEL_Y_FAR = meters_per_px_base * 1.3
+    METRES_PAR_PIXEL_Y_FAR = meters_per_px_base * 0.9
 
     for (x, y, area) in shot_points:
         # décalage en px
@@ -554,3 +554,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
