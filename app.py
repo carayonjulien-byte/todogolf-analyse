@@ -67,7 +67,26 @@ def keep_points_in_circle(points, center, radius_px):
 # DÉTECTION DES REPÈRES
 # --------------------------------
 def find_black_calibration_points(bgr_image):
+    """
+    Détecte les 3 repères (ronds ou carrés) en ignorant les éléments rouges (impacts).
+    On masque d'abord le rouge, puis on cherche les formes sombres.
+    """
+    # 1) on masque le rouge
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+    lower_red_1 = np.array([0, 70, 50])
+    upper_red_1 = np.array([15, 255, 255])
+    lower_red_2 = np.array([165, 70, 50])
+    upper_red_2 = np.array([179, 255, 255])
+    mask_red_1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
+    mask_red_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
+    mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
+
+    # on travaille en niveaux de gris mais on enlève les zones rouges
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+    # les pixels rouges → on les met en blanc pour qu'ils ne soient pas pris pour des repères
+    gray[mask_red > 0] = 255
+
+    # 2) seuillage adaptatif comme avant
     thresh = cv2.adaptiveThreshold(
         gray,
         255,
@@ -78,6 +97,7 @@ def find_black_calibration_points(bgr_image):
     )
     kernel = np.ones((3, 3), np.uint8)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
@@ -90,7 +110,7 @@ def find_black_calibration_points(bgr_image):
         if per == 0:
             continue
         circularity = 4 * np.pi * (area / (per * per))
-        if circularity < 0.5:
+        if circularity < 0.45:  # tolérant pour les carrés imprimés
             continue
 
         M = cv2.moments(c)
@@ -506,4 +526,5 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
