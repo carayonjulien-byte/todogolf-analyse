@@ -443,7 +443,7 @@ def mask_route():
     h, w = img.shape[:2]
     if max(h, w) > MAX_SIDE:
         scale = MAX_SIDE / float(max(h, w))
-        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
     calib_points, _ = find_black_calibration_points(img)
     calib_struct = order_calibration_points(calib_points) if calib_points else None
@@ -531,6 +531,7 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
