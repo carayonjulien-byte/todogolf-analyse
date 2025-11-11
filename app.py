@@ -118,6 +118,7 @@ def find_black_calibration_points(bgr_image):
     candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
     return candidates[:3], thresh
 
+
 def order_calibration_points(calib_points):
     if len(calib_points) < 3:
         return None
@@ -198,20 +199,16 @@ def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct, cal
 
 
 # --------------------------------
-# AUTO ÉCHELLE (1 m ou 5 m) — AJOUT
+# AUTO ÉCHELLE (1 m ou 5 m)
 # --------------------------------
 def guess_ring_step_from_calib(img, calib_points):
     """
     Devine l'échelle à partir de la forme des repères détectés.
-    On regarde le nombre de côtés du contour associé à chaque repère :
-    - majorité de 4 côtés -> carrés -> 1 m
-    - sinon -> ronds -> 5 m
     """
     if not calib_points or len(calib_points) < 3:
         return DEFAULT_RING_STEP_M, "default"
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # même seuillage simple que tout à l'heure
     _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -230,7 +227,6 @@ def guess_ring_step_from_calib(img, calib_points):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # on vérifie que ce contour correspond à un des 3 repères trouvés
         is_calib = False
         for (px, py, _) in calib_points:
             if (px - cx) ** 2 + (py - cy) ** 2 < 25**2:
@@ -241,23 +237,22 @@ def guess_ring_step_from_calib(img, calib_points):
 
         matched += 1
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.04 * peri, True)  # 4% du périmètre
+        approx = cv2.approxPolyDP(c, 0.04 * peri, True)
         sides = len(approx)
 
         if sides == 4:
             square_count += 1
         else:
-            # tout ce qui n'est pas carré, on le range dans "rond-ish"
             circle_like_count += 1
 
     if matched == 0:
         return DEFAULT_RING_STEP_M, "no-match"
 
-    # règle simple : si au moins 2 repères sont carrés -> 1 m, sinon 5 m
     if square_count >= 2:
         return 1.0, f"square({square_count}/3)"
     else:
         return 5.0, f"round({circle_like_count}/3)"
+
 
 # --------------------------------
 # POINTS ROUGES
@@ -297,7 +292,7 @@ def find_red_points(bgr_image,
 
 
 # --------------------------------
-# RÉSUMÉ
+# RÉSUMÉ (pas utilisé dans ton /analyze actuel, je laisse)
 # --------------------------------
 def build_resume(coups, centre_distance=None):
     if not coups:
@@ -359,7 +354,7 @@ def analyze():
     if img is None:
         return jsonify({"error": "Impossible de lire l'image"}), 400
 
-    # réduction éventuelle de l'image (optionnel mais tu l'as ajouté)
+    # réduction éventuelle de l'image
     MAX_SIDE = 1600
     h, w = img.shape[:2]
     if max(h, w) > MAX_SIDE:
@@ -383,36 +378,55 @@ def analyze():
 
     # 3) deviner 1 m ou 5 m
     ring_step_m, ring_reason = guess_ring_step_from_calib(img, calib_points)
-    # distance max que représente le grand cercle
-    max_distance_m = ring_step_m * NB_RINGS
+    max_distance_m = ring_step_m * NB_RINGS  # distance réelle représentée par le grand cercle
 
     # 4) points rouges
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
-    # 5) conversions
-    meters_per_px = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
+    # 5) base de conversion px -> m (moyenne, utilisée surtout pour latéral)
+    meters_per_px_base = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
-    # 6) fabrication des coups (version “brute” que tu veux)
+    # 6) fabrication des coups (version Pythagore + arrondi + profondeur variable)
     coups = []
     cx, cy = radar_center
+    centre_for_calc = float(centre_distance or 0)
+
+    # paramètres pour faire varier la profondeur
+    MAX_PROFONDEUR_PX = outer_radius_px  # on prend le rayon comme "loin"
+    METRES_PAR_PIXEL_Y_NEAR = meters_per_px_base
+    # on augmente un peu la profondeur pour les points éloignés
+    METRES_PAR_PIXEL_Y_FAR = meters_per_px_base * 1.1
+
     for (x, y, area) in shot_points:
         # décalage en px
         dx_px = x - cx           # droite / gauche
         dy_px = y - cy           # bas / haut (y augmente vers le bas)
 
-        # en mètres
-        ecart_lateral_m = round(dx_px * meters_per_px, 2)
-        # on inverse le signe pour que “vers le haut” = positif = plus long
-        ecart_profondeur_m = round(-dy_px * meters_per_px, 2)
+        # latéral en m (assez linéaire)
+        ecart_lateral_m = dx_px * meters_per_px_base
 
-        # distance radiale (Pythagore) pour la distance totale
-        distance_ecart_m = math.sqrt(dx_px**2 + dy_px**2) * meters_per_px
+        # profondeur : on fait varier le facteur selon la distance en px
+        dist_px = abs(dy_px)
+        ratio = min(dist_px / float(MAX_PROFONDEUR_PX), 1.0)
+        metres_par_pixel_y = METRES_PAR_PIXEL_Y_NEAR + ratio * (METRES_PAR_PIXEL_Y_FAR - METRES_PAR_PIXEL_Y_NEAR)
 
-        if centre_distance is not None:
-            distance_totale_m = round(centre_distance + distance_ecart_m, 2)
-        else:
-            distance_totale_m = round(distance_ecart_m, 2)
+        # on inverse le signe pour que "vers le haut" = + (plus long)
+        ecart_profondeur_m = -dy_px * metres_par_pixel_y
+
+        # 1) distance dans l’axe
+        distance_dans_laxe_m = centre_for_calc + ecart_profondeur_m
+
+        # 2) Pythagore
+        distance_totale_m = math.sqrt(distance_dans_laxe_m ** 2 + ecart_lateral_m ** 2)
+
+        # 3) arrondi au 0,5 m
+        distance_totale_m = round(distance_totale_m * 2) / 2
+
+        # 4) formatage à 1 décimale
+        distance_totale_m = float(f"{distance_totale_m:.1f}")
+        ecart_lateral_m = float(f"{ecart_lateral_m:.1f}")
+        ecart_profondeur_m = float(f"{ecart_profondeur_m:.1f}")
 
         coups.append({
             "distance_totale_m": distance_totale_m,
@@ -433,6 +447,7 @@ def analyze():
             "ring_step_m": ring_step_m,
             "ring_reason": ring_reason,
             "calib_points": calib_points,
+            "meters_per_px_base": meters_per_px_base,
         }
     })
 
@@ -539,11 +554,5 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
 
 
