@@ -68,7 +68,8 @@ def keep_points_in_circle(points, center, radius_px):
 # --------------------------------
 def find_black_calibration_points(bgr_image):
     """
-    Détecte les 3 repères (ronds ou carrés) en ignorant les impacts rouges.
+    Détecte les 3 repères (ronds / carrés / triangles) en ignorant les impacts rouges.
+    (Ajout : triangles acceptés en plus des ronds/carrés)
     """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     thresh = cv2.adaptiveThreshold(
@@ -109,8 +110,16 @@ def find_black_calibration_points(bgr_image):
         per = cv2.arcLength(c, True)
         if per == 0:
             continue
+
+        # circularité (pour ronds/blobs)
         circularity = 4 * np.pi * (area / (per * per))
-        if circularity < 0.45:
+
+        # ajout: approx poly pour accepter triangles/carrés
+        approx = cv2.approxPolyDP(c, 0.04 * per, True)
+        sides = len(approx)
+
+        # On accepte si: assez rond OU triangle (3) OU carré (4)
+        if not (circularity >= 0.45 or sides in (3, 4)):
             continue
 
         candidates.append((cx, cy, int(area)))
@@ -154,10 +163,9 @@ def find_outer_circle_quick(bgr_image):
 
 def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct, calib_points):
     """
-    1. on ESSAIE d'abord de faire le cercle qui passe EXACTEMENT par les 3 centres détectés
-    2. si ça marche pas (alignés / pas 3 points), on retombe sur le calcul haut+bas
-    3. sinon fallback
-    On retourne aussi une raison pour le debug.
+    1. Essayer le cercle passant par les 3 centres détectés
+    2. Sinon, estimation géométrique (haut+bas)
+    3. Sinon, fallback
     """
     h, w = img.shape[:2]
 
@@ -170,11 +178,8 @@ def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct, cal
         if circle is not None:
             cx, cy, r = circle
             return (cx, cy), r, True, "3points-ok"
-        else:
-            # on avait 3 points mais trop alignés
-            pass
 
-    # 2) estimation géométrique (comme tu l'avais)
+    # 2) estimation géométrique
     if calib_struct is not None:
         top = calib_struct["top"]
         bl = calib_struct["bottom_left"]
@@ -194,26 +199,31 @@ def get_radar_center_and_radius_from_template_or_fallback(img, calib_struct, cal
     if oc is not None:
         return (oc[0], oc[1]), oc[2], False, "fallback-contour"
 
-    # 4) dernier recours
+    # dernier recours
     return image_center(img), min(h, w) // 2, False, "fallback-center"
 
 
 # --------------------------------
-# AUTO ÉCHELLE (1 m ou 5 m)
+# AUTO ÉCHELLE (triangle=1m, carré=2m, rond=5m)
 # --------------------------------
 def guess_ring_step_from_calib(img, calib_points):
     """
     Devine l'échelle à partir de la forme des repères détectés.
+    - triangle -> 1 m (putting)
+    - carré    -> 2 m (approches)
+    - rond     -> 5 m (long jeu)
+    On prend la forme majoritaire parmi les repères matchés.
     """
-    if not calib_points or len(calib_points) < 3:
+    if not calib_points or len(calib_points) < 1:
         return DEFAULT_RING_STEP_M, "default"
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    square_count = 0
-    circle_like_count = 0
+    triangles = 0
+    squares = 0
+    circles = 0
     matched = 0
 
     for c in contours:
@@ -227,6 +237,7 @@ def guess_ring_step_from_calib(img, calib_points):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
+        # est-ce que ce contour correspond à un des centres trouvés ?
         is_calib = False
         for (px, py, _) in calib_points:
             if (px - cx) ** 2 + (py - cy) ** 2 < 25**2:
@@ -239,19 +250,30 @@ def guess_ring_step_from_calib(img, calib_points):
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.04 * peri, True)
         sides = len(approx)
+        circularity = 4 * np.pi * (area / (peri * peri)) if peri > 0 else 0
 
-        if sides == 4:
-            square_count += 1
+        if sides == 3:
+            triangles += 1
+        elif sides == 4:
+            squares += 1
         else:
-            circle_like_count += 1
+            if circularity > 0.6:
+                circles += 1
+            else:
+                circles += 1  # on range les blobs arrondis avec les ronds
 
     if matched == 0:
         return DEFAULT_RING_STEP_M, "no-match"
 
-    if square_count >= 2:
-        return 1.0, f"square({square_count}/3)"
-    else:
-        return 5.0, f"round({circle_like_count}/3)"
+    # majorité triangle > carré > rond
+    if triangles >= squares and triangles >= circles and triangles > 0:
+        return 1.0, f"triangle({triangles})"
+    if squares >= circles and squares > 0:
+        return 2.0, f"square({squares})"
+    if circles > 0:
+        return 5.0, f"circle({circles})"
+
+    return DEFAULT_RING_STEP_M, "fallback"
 
 
 # --------------------------------
@@ -376,7 +398,7 @@ def analyze():
         calib_points
     )
 
-    # 3) deviner 1 m ou 5 m
+    # 3) deviner 1 m / 2 m / 5 m selon la forme
     ring_step_m, ring_reason = guess_ring_step_from_calib(img, calib_points)
     max_distance_m = ring_step_m * NB_RINGS  # distance réelle représentée par le grand cercle
 
@@ -387,31 +409,30 @@ def analyze():
     # 5) base de conversion px -> m (moyenne, utilisée surtout pour latéral)
     meters_per_px_base = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
-    # 6) fabrication des coups (version Pythagore + arrondi + profondeur variable)
+    # 6) fabrication des coups (version Pythagore + arrondi + profondeur variable légère)
     coups = []
     cx, cy = radar_center
     centre_for_calc = float(centre_distance or 0)
 
-    # paramètres pour faire varier la profondeur
+    # paramètres pour faire varier LÉGÈREMENT la profondeur
     MAX_PROFONDEUR_PX = outer_radius_px  # on prend le rayon comme "loin"
     METRES_PAR_PIXEL_Y_NEAR = meters_per_px_base
-    # on augmente un peu la profondeur pour les points éloignés
-    METRES_PAR_PIXEL_Y_FAR = meters_per_px_base * 1.1
+    METRES_PAR_PIXEL_Y_FAR = meters_per_px_base * 1.1  # léger correctif perspective
 
     for (x, y, area) in shot_points:
         # décalage en px
         dx_px = x - cx           # droite / gauche
         dy_px = y - cy           # bas / haut (y augmente vers le bas)
 
-        # latéral en m (assez linéaire)
+        # latéral en m (constant)
         ecart_lateral_m = dx_px * meters_per_px_base
 
-        # profondeur : on fait varier le facteur selon la distance en px
+        # profondeur : facteur qui augmente un peu avec l'éloignement vertical
         dist_px = abs(dy_px)
         ratio = min(dist_px / float(MAX_PROFONDEUR_PX), 1.0)
         metres_par_pixel_y = METRES_PAR_PIXEL_Y_NEAR + ratio * (METRES_PAR_PIXEL_Y_FAR - METRES_PAR_PIXEL_Y_NEAR)
 
-        # on inverse le signe pour que "vers le haut" = + (plus long)
+        # signe: vers le haut = plus long
         ecart_profondeur_m = -dy_px * metres_par_pixel_y
 
         # 1) distance dans l’axe
@@ -554,5 +575,3 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
-
-
