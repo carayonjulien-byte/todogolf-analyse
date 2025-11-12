@@ -1,13 +1,22 @@
 import os
 import tempfile
 from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 import cv2
 import numpy as np
 import math
 import itertools
 
 app = Flask(__name__)
-
+CORS(
+    app,
+    resources={r"/*": {
+        "origins": ["https://lab.todogolf.fr", "http://localhost:5500", "http://localhost:5173"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "X-API-Key"]
+    }},
+    supports_credentials=False
+)
 # --------------------------------
 # CONSTANTES
 # --------------------------------
@@ -583,3 +592,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
