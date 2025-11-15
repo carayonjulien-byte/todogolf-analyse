@@ -5,6 +5,7 @@ from flask_cors import CORS
 import cv2
 import numpy as np
 import math
+import itertools
 
 app = Flask(__name__)
 CORS(
@@ -16,25 +17,25 @@ CORS(
     }},
     supports_credentials=False
 )
-
 # --------------------------------
 # CONSTANTES
 # --------------------------------
-# Aire minimale / maximale des repères (en pixels² sur l'image redimensionnée)
-# 3 mm → très petits en px, donc seuil mini assez bas
-CALIB_MIN_AREA = 40          # plus bas pour ne pas louper le triangle
+CALIB_MIN_AREA = 300        # tolérance repères imprimés
 CALIB_MAX_AREA = 120000
-
-# Aire des impacts rouges (points) pour la détection des coups
 MIN_RED_AREA_FALLBACK = 100
 MAX_RED_AREA_FALLBACK = 5000
-
 NB_RINGS = 4
-DEFAULT_RING_STEP_M = 5.0  # valeur par défaut si l'échelle n'est pas déduite
+DEFAULT_RING_STEP_M = 5.0
+
+# Tolérances géométrie du triangle (en pixels)
+# -> ajuste selon ta taille d'impression et résolution typique des photos
+GEOM_Y_TOL = 25      # Alignement vertical des 2 points du bas
+GEOM_X_TOL = 60      # Centrage horizontal du point haut vs milieu de la base
+GEOM_MIN_SPREAD = 40 # Écart vertical mini (base -> top)
 
 
 # --------------------------------
-# OUTILS GÉOMÉTRIQUES
+# OUTILS
 # --------------------------------
 def circle_from_3_points(p1, p2, p3):
     """
@@ -65,9 +66,6 @@ def image_center(img):
 
 
 def keep_points_in_circle(points, center, radius_px):
-    """
-    Filtre les points pour ne garder que ceux à l'intérieur d'un cercle.
-    """
     if center is None or radius_px is None:
         return points
     cx, cy = center
@@ -79,25 +77,15 @@ def keep_points_in_circle(points, center, radius_px):
 
 
 # --------------------------------
-# DÉTECTION DES REPÈRES (3 points noirs)
+# DÉTECTION DES REPÈRES
 # --------------------------------
 def find_black_calibration_points(bgr_image):
     """
-    Détecte les 3 repères sombres (rond / carré / triangle),
-    en ignorant les impacts rouges.
-
-    Stratégie :
-    - on récupère tous les blobs sombres non rouges
-    - on filtre par :
-        * aire dans [CALIB_MIN_AREA, CALIB_MAX_AREA]
-        * forme compacte (pas un trait, pas un anneau vide)
-        * ratio largeur/hauteur ~ 1
-    - on trie par aire
-    - on garde uniquement ceux qui ont une aire proche de la plus grande
-      (repères imprimés identiques → tailles proches)
-    - puis on retourne les 3 plus gros parmi ce groupe
+    Détecte les 3 repères noirs (rond / carré / triangle), en ignorant les impacts rouges.
+    (Ajout: triangles acceptés via approxPolyDP)
     """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+    # un léger equalize pour aider le repère du haut si la zone est claire
     gray = cv2.equalizeHist(gray)
 
     thresh = cv2.adaptiveThreshold(
@@ -110,28 +98,14 @@ def find_black_calibration_points(bgr_image):
     )
     kernel = np.ones((3, 3), np.uint8)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
-    raw_candidates = []
+    candidates = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < CALIB_MIN_AREA or area > CALIB_MAX_AREA:
-            continue
-
-        x, y, w, h = cv2.boundingRect(c)
-        if w == 0 or h == 0:
-            continue
-
-        # ratio largeur/hauteur proche de 1 → on évite les formes très allongées
-        ratio = w / float(h)
-        if not (0.6 <= ratio <= 1.4):
-            continue
-
-        # compacité : on évite les contours trop "vides" (traits fins, grands arcs)
-        fill_ratio = area / float(w * h)
-        if fill_ratio < 0.35:
             continue
 
         M = cv2.moments(c)
@@ -140,10 +114,9 @@ def find_black_calibration_points(bgr_image):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # exclure le rouge (impacts)
-        h_col, s_col, v_col = hsv[cy, cx]
-        is_red = ((0 <= h_col <= 15 and s_col > 60 and v_col > 40) or
-                  (165 <= h_col <= 179 and s_col > 60 and v_col > 40))
+        # on vire les trucs rouges
+        h, s, v = hsv[cy, cx]
+        is_red = ((0 <= h <= 15 and s > 60 and v > 40) or (165 <= h <= 179 and s > 60 and v > 40))
         if is_red:
             continue
 
@@ -151,63 +124,56 @@ def find_black_calibration_points(bgr_image):
         if per == 0:
             continue
 
+        # circularité (pour blobs ronds)
+        circularity = 4 * np.pi * (area / (per * per))
+        # approx polygone (pour triangles/carrés)
         approx = cv2.approxPolyDP(c, 0.04 * per, True)
         sides = len(approx)
-        circularity = 4 * np.pi * (area / (per * per))
 
-        # On accepte si :
-        # - assez rond (circularité élevée), ou
-        # - triangle (3 côtés), ou
-        # - carré (4 côtés)
+        # On accepte si assez rond OU triangle (3) OU carré (4)
         if not (circularity >= 0.45 or sides in (3, 4)):
             continue
 
-        raw_candidates.append((cx, cy, int(area), w, h))
+        candidates.append((cx, cy, int(area)))
 
-    if len(raw_candidates) == 0:
-        return [], thresh
-
-    # tri par aire décroissante
-    raw_candidates.sort(key=lambda p: p[2], reverse=True)
-
-    # on part de la plus grande aire comme référence
-    base_area = float(raw_candidates[0][2])
-
-    # on garde uniquement les formes dont l'aire est "proche" de la plus grande
-    # → ex : entre 40% et 250% de la plus grande
-    filtered = [
-        (cx, cy, area)
-        for (cx, cy, area, w, h) in raw_candidates
-        if (area >= base_area * 0.4 and area <= base_area * 2.5)
-    ]
-
-    # si après ce filtrage il reste moins de 3 points, on reprend les bruts
-    candidates = filtered if len(filtered) >= 3 else [
-        (cx, cy, area) for (cx, cy, area, w, h) in raw_candidates
-    ]
-
-    # on garde les 3 plus gros
-    candidates = sorted(candidates, key=lambda p: p[2], reverse=True)[:3]
-    return candidates, thresh
+    candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
+    return candidates[:3], thresh
 
 
-def order_calibration_points(calib_points, use_relaxed=True):
+def order_calibration_points(calib_points):
     """
-    Version très simple :
-    - on prend les 3 plus gros points (déjà triés par find_black_calibration_points)
-    - on trie par Y
-    - le plus haut = top
-    - les deux autres = bottom_left / bottom_right (par X)
+    Ordonne les 3 repères en (top, bottom_left, bottom_right) SI la géométrie "triangle isocèle"
+    est plausible :
+      - deux points du bas quasi alignés (|y1 - y2| <= GEOM_Y_TOL)
+      - point du haut au-dessus d'un minimum (GEOM_MIN_SPREAD)
+      - point du haut proche du milieu de la base (|x_top - x_mid_base| <= GEOM_X_TOL)
+    Sinon, retourne None (refus).
     """
     if not calib_points or len(calib_points) < 3:
         return None
 
+    # on garde les 3 plus gros si plus de 3
     pts = sorted(calib_points, key=lambda p: p[2], reverse=True)[:3]
+    # tri par Y croissant : top en premier
     pts_y = sorted(pts, key=lambda p: p[1])
-
     top = pts_y[0]
     b1, b2 = pts_y[1], pts_y[2]
 
+    # 1) deux points du bas quasi alignés
+    if abs(b1[1] - b2[1]) > GEOM_Y_TOL:
+        return None
+
+    # 2) le point du haut suffisamment au-dessus
+    base_y = (b1[1] + b2[1]) / 2.0
+    if (base_y - top[1]) < GEOM_MIN_SPREAD:
+        return None
+
+    # 3) le point du haut proche du milieu horizontal de la base
+    x_mid_base = (b1[0] + b2[0]) / 2.0
+    if abs(top[0] - x_mid_base) > GEOM_X_TOL:
+        return None
+
+    # OK, on ordonne gauche/droite
     if b1[0] < b2[0]:
         bottom_left, bottom_right = b1, b2
     else:
@@ -220,16 +186,18 @@ def order_calibration_points(calib_points, use_relaxed=True):
     }
 
 
+# --------------------------------
+# CENTRE/RAYON – STRICT (PAS DE FALLBACK)
+# --------------------------------
 def get_radar_center_and_radius_strict(img, calib_struct, calib_points):
     """
-    Version triangle simple :
-    - on part des 3 repères ordonnés (top, bottom_left, bottom_right)
-    - on calcule le cercle passant par ces 3 points
+    Version stricte : pas de fallback.
+    Nécessite 3 repères et un triangle géométriquement valide.
     """
     if calib_struct is not None and calib_points and len(calib_points) == 3:
-        p1 = (calib_struct["top"][0],          calib_struct["top"][1])
-        p2 = (calib_struct["bottom_left"][0],  calib_struct["bottom_left"][1])
-        p3 = (calib_struct["bottom_right"][0], calib_struct["bottom_right"][1])
+        p1 = (calib_struct["top"][0],           calib_struct["top"][1])
+        p2 = (calib_struct["bottom_left"][0],   calib_struct["bottom_left"][1])
+        p3 = (calib_struct["bottom_right"][0],  calib_struct["bottom_right"][1])
         circle = circle_from_3_points(p1, p2, p3)
         if circle is not None:
             cx, cy, r = circle
@@ -293,6 +261,7 @@ def guess_ring_step_from_calib(img, calib_points):
         elif sides == 4:
             squares += 1
         else:
+            # blobs arrondis -> ronds
             circles += 1 if circularity > 0.6 else 1
 
     if matched == 0:
@@ -308,18 +277,16 @@ def guess_ring_step_from_calib(img, calib_points):
 
 
 # --------------------------------
-# POINTS ROUGES (impacts)
+# POINTS ROUGES
 # --------------------------------
 def find_red_points(bgr_image,
                     min_area=MIN_RED_AREA_FALLBACK,
                     max_area=MAX_RED_AREA_FALLBACK):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-
     lower_red_1 = np.array([0, 70, 50])
     upper_red_1 = np.array([15, 255, 255])
     lower_red_2 = np.array([165, 70, 50])
     upper_red_2 = np.array([179, 255, 255])
-
     mask1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
     mask2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
     mask = cv2.bitwise_or(mask1, mask2)
@@ -347,11 +314,56 @@ def find_red_points(bgr_image,
 
 
 # --------------------------------
+# RÉSUMÉ (non utilisé ici, conservé)
+# --------------------------------
+def build_resume(coups, centre_distance=None):
+    if not coups:
+        return {
+            "moyenne_distance_m": None,
+            "moyenne_lateral_m": None,
+            "dispersion_distance_m": None,
+            "dispersion_lateral_m": None,
+            "tendance": "aucun coup détecté"
+        }
+
+    distances = np.array([c["distance"] for c in coups], dtype=float)
+    lats = np.array([c["lateral_m"] for c in coups], dtype=float)
+
+    moyenne_distance = float(np.mean(distances))
+    moyenne_lateral = float(np.mean(lats))
+    dispersion_distance = float(np.std(distances, ddof=0))
+    dispersion_lateral = float(np.std(lats, ddof=0))
+
+    tendance_parts = []
+    if centre_distance is not None:
+        diff = moyenne_distance - centre_distance
+        if diff < -1.0:
+            tendance_parts.append("court")
+        elif diff > 1.0:
+            tendance_parts.append("long")
+
+    if moyenne_lateral < -0.5:
+        tendance_parts.append("gauche")
+    elif moyenne_lateral > 0.5:
+        tendance_parts.append("droite")
+
+    tendance = "dans l'axe" if not tendance_parts else " et ".join(tendance_parts)
+
+    return {
+        "moyenne_distance_m": round(moyenne_distance, 2),
+        "moyenne_lateral_m": round(moyenne_lateral, 2),
+        "dispersion_distance_m": round(dispersion_distance, 2),
+        "dispersion_lateral_m": round(dispersion_lateral, 2),
+        "tendance": tendance
+    }
+
+
+# --------------------------------
 # ROUTES
 # --------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API – repères 3mm, détection tolérante + filtre d’aire similaire", 200
+    return "Radar ToDoGolf API – strict triangle + formes (triangle=1m, carré=2m, rond=5m)", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -375,11 +387,11 @@ def analyze():
     centre_distance = request.form.get("centre_distance")
     centre_distance = float(centre_distance) if centre_distance else None
 
-    # 1) Repères
+    # 1) repères
     calib_points, _ = find_black_calibration_points(img)
-    calib_struct = order_calibration_points(calib_points)  # version simple
+    calib_struct = order_calibration_points(calib_points)  # STRICT: retourne None si triangle invalide
 
-    # 2) Centre + rayon (triangle simple)
+    # 2) centre + rayon (STRICT, pas de fallback)
     radar_center, outer_radius_px, used_3pt_circle, circle_reason = get_radar_center_and_radius_strict(
         img,
         calib_struct,
@@ -395,21 +407,23 @@ def analyze():
             }
         }), 400
 
-    # 3) Échelle (triangle=1, carré=2, rond=5)
+    # 3) échelle (triangle=1, carré=2, rond=5)
     ring_step_m, ring_reason = guess_ring_step_from_calib(img, calib_points)
     max_distance_m = ring_step_m * NB_RINGS  # distance réelle représentée par le grand cercle
 
-    # 4) Points rouges (coups)
+    # 4) points rouges
     shot_points, _ = find_red_points(img)
     shot_points = keep_points_in_circle(shot_points, radar_center, outer_radius_px)
 
-    # 5) Conversion px -> mètres
+    # 5) base conversion px -> m
     meters_per_px_base = max_distance_m / float(outer_radius_px) if outer_radius_px > 0 else 0.1
 
+    # 6) fabrication des coups (Pythagore + arrondi 0,5 m + 1 décimale)
     coups = []
     cx, cy = radar_center
     centre_for_calc = float(centre_distance or 0)
 
+    # on garde une très légère correction Y si tu veux, sinon mets = meters_per_px_base
     MAX_PROFONDEUR_PX = outer_radius_px
     METRES_PAR_PIXEL_Y_NEAR = meters_per_px_base
     METRES_PAR_PIXEL_Y_FAR = meters_per_px_base * 1.1
@@ -448,7 +462,7 @@ def analyze():
         "nb_coups": len(coups),
         "coups": coups,
         "debug": {
-            "nb_points_calib": len(calib_points) if calib_points else 0,
+            "nb_points_calib": len(calib_points),
             "calib_points": calib_points,
             "origin_px": [float(radar_center[0]), float(radar_center[1])],
             "outer_radius_px": float(outer_radius_px),
@@ -485,6 +499,7 @@ def mask_route():
         calib_points
     )
     if radar_center is None:
+        # en mode strict, on renvoie une erreur JSON (le /test_mask attend une image, mais c'est plus sûr)
         return jsonify({
             "error": "Repères invalides pour /mask.",
             "debug": {
@@ -523,16 +538,16 @@ def mask_route():
 
 
 # --------------------------------
-# PAGES DE TEST (optionnel)
+# PAGES DE TEST
 # --------------------------------
 @app.route("/test")
 def test_page():
     return """
     <html><body style='font-family:sans-serif'>
-    <h2>Radar ToDoGolf – Test /analyze</h2>
+    <h2>Radar ToDoGolf – Test /analyze (STRICT)</h2>
     <form action="/analyze" method="post" enctype="multipart/form-data">
       <p><input type="file" name="image" required></p>
-      <p><input type="text" name="club" placeholder="Ex: Fer 7"></p>
+      <p><input type="text" name="club" placeholder="Ex: Fer7"></p>
       <p><input type="number" step="0.1" name="centre_distance" placeholder="Ex: 100"></p>
       <button type="submit">Analyser</button>
     </form>
@@ -544,7 +559,7 @@ def test_page():
 def test_mask_page():
     return """
     <html><body style='font-family:sans-serif'>
-    <h2>Radar ToDoGolf – Test /mask</h2>
+    <h2>Radar ToDoGolf – Test /mask (STRICT)</h2>
     <form id="maskForm" enctype="multipart/form-data">
       <p><input type="file" id="image" name="image" required></p>
       <button type="submit">Afficher le masque</button>
