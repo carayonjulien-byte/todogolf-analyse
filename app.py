@@ -282,11 +282,25 @@ def guess_ring_step_from_calib(img, calib_points):
 def find_red_points(bgr_image,
                     min_area=MIN_RED_AREA_FALLBACK,
                     max_area=MAX_RED_AREA_FALLBACK):
+    """
+    Détection des impacts rouges avec filtrage adaptatif par aire.
+
+    Étapes :
+    1) Masque rouge en HSV.
+    2) On récupère des contours "plausibles" (assez larges).
+    3) On calcule l'aire médiane des blobs.
+    4) On garde ceux dont l'aire est proche de cette médiane
+       (les points rouges imprimés ont à peu près la même taille).
+    """
+
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-    lower_red_1 = np.array([0, 70, 50])
+
+    # Masque rouge (un peu plus strict en saturation / luminosité)
+    lower_red_1 = np.array([0, 80, 70])
     upper_red_1 = np.array([15, 255, 255])
-    lower_red_2 = np.array([165, 70, 50])
+    lower_red_2 = np.array([165, 80, 70])
     upper_red_2 = np.array([179, 255, 255])
+
     mask1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
     mask2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
     mask = cv2.bitwise_or(mask1, mask2)
@@ -297,20 +311,51 @@ def find_red_points(bgr_image,
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    points = []
+    raw = []
     for c in contours:
         area_px = cv2.contourArea(c)
-        if area_px < min_area or area_px > max_area:
+        # large au début, on affinera ensuite
+        if area_px < 20 or area_px > 20000:
             continue
+
         x, y, w, h = cv2.boundingRect(c)
         if h == 0:
             continue
-        ratio = w / h
-        if 0.5 <= ratio <= 1.5:
-            cx = int(x + w / 2)
-            cy = int(y + h / 2)
-            points.append((cx, cy, area_px))
-    return points, mask
+
+        ratio = w / float(h)
+        # on évite les formes très allongées
+        if not (0.5 <= ratio <= 1.6):
+            continue
+
+        cx = int(x + w / 2)
+        cy = int(y + h / 2)
+
+        raw.append((cx, cy, area_px, w, h))
+
+    # Pas de blobs rouges plausibles
+    if not raw:
+        return [], mask
+
+    # Aires et médiane
+    areas = sorted([a for (_, _, a, _, _) in raw])
+    median_area = areas[len(areas) // 2]
+
+    # Fenêtre d'acceptation autour de la médiane
+    area_min_dyn = max(median_area * 0.4, 20)
+    area_max_dyn = min(median_area * 2.5, 20000)
+
+    filtered = [
+        (cx, cy, area)
+        for (cx, cy, area, w, h) in raw
+        if area_min_dyn <= area <= area_max_dyn
+    ]
+
+    # Si on a tout viré (cas extrême), on retombe sur les bruts
+    if len(filtered) == 0:
+        filtered = [(cx, cy, area) for (cx, cy, area, w, h) in raw]
+
+    return filtered, mask
+
 
 
 # --------------------------------
@@ -592,3 +637,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
