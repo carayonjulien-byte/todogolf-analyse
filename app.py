@@ -356,8 +356,6 @@ def find_red_points(bgr_image,
 
     return filtered, mask
 
-
-
 # --------------------------------
 # RÉSUMÉ (non utilisé ici, conservé)
 # --------------------------------
@@ -637,4 +635,5 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
