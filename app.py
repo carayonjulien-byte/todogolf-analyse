@@ -29,9 +29,12 @@ DEFAULT_RING_STEP_M = 5.0
 
 # Tolérances géométrie du triangle (en pixels)
 # -> ajuste selon ta taille d'impression et résolution typique des photos
-GEOM_Y_TOL = 25      # Alignement vertical des 2 points du bas
-GEOM_X_TOL = 60      # Centrage horizontal du point haut vs milieu de la base
-GEOM_MIN_SPREAD = 40 # Écart vertical mini (base -> top)
+# GEOM_Y_TOL = 25      # Alignement vertical des 2 points du bas
+# GEOM_X_TOL = 60      # Centrage horizontal du point haut vs milieu de la base
+# GEOM_MIN_SPREAD = 40 # Écart vertical mini (base -> top)
+RELAXED_GEOM_Y_TOL = 80     # tolérance Y plus large pour les 2 points du bas
+RELAXED_GEOM_X_TOL = 140    # tolérance X plus large pour le centrage du point haut
+RELAXED_GEOM_MIN_SPREAD = 15  # triangle plus "plat" accepté
 
 
 # --------------------------------
@@ -140,14 +143,20 @@ def find_black_calibration_points(bgr_image):
     return candidates[:3], thresh
 
 
-def order_calibration_points(calib_points):
+def order_calibration_points(calib_points, use_relaxed=True):
     """
-    Ordonne les 3 repères en (top, bottom_left, bottom_right) SI la géométrie "triangle isocèle"
-    est plausible :
-      - deux points du bas quasi alignés (|y1 - y2| <= GEOM_Y_TOL)
-      - point du haut au-dessus d'un minimum (GEOM_MIN_SPREAD)
-      - point du haut proche du milieu de la base (|x_top - x_mid_base| <= GEOM_X_TOL)
-    Sinon, retourne None (refus).
+    Ordonne les 3 repères en (top, bottom_left, bottom_right).
+
+    1) On essaie d'abord un contrôle STRICT :
+       - deux points du bas quasi alignés (|y1 - y2| <= GEOM_Y_TOL)
+       - point du haut suffisamment au-dessus (>= GEOM_MIN_SPREAD)
+       - point du haut centré (|x_top - x_mid_base| <= GEOM_X_TOL)
+
+    2) Si ça échoue et use_relaxed=True :
+       → on applique des contraintes plus souples (RELAXED_*).
+       → si ça passe, on accepte quand même les repères.
+
+    Si tout échoue → None (repères invalides).
     """
     if not calib_points or len(calib_points) < 3:
         return None
@@ -159,19 +168,39 @@ def order_calibration_points(calib_points):
     top = pts_y[0]
     b1, b2 = pts_y[1], pts_y[2]
 
-    # 1) deux points du bas quasi alignés
-    if abs(b1[1] - b2[1]) > GEOM_Y_TOL:
-        return None
+    def check_geom(tolerances):
+        """Retourne True si la géométrie est OK avec les tolérances fournies."""
+        y_tol, x_tol, min_spread = tolerances
 
-    # 2) le point du haut suffisamment au-dessus
-    base_y = (b1[1] + b2[1]) / 2.0
-    if (base_y - top[1]) < GEOM_MIN_SPREAD:
-        return None
+        # 1) deux points du bas quasi alignés
+        if abs(b1[1] - b2[1]) > y_tol:
+            return False
 
-    # 3) le point du haut proche du milieu horizontal de la base
-    x_mid_base = (b1[0] + b2[0]) / 2.0
-    if abs(top[0] - x_mid_base) > GEOM_X_TOL:
+        # 2) le point du haut suffisamment au-dessus
+        base_y = (b1[1] + b2[1]) / 2.0
+        if (base_y - top[1]) < min_spread:
+            return False
+
+        # 3) le point du haut proche du milieu horizontal de la base
+        x_mid_base = (b1[0] + b2[0]) / 2.0
+        if abs(top[0] - x_mid_base) > x_tol:
+            return False
+
+        return True
+
+    # --- 1) tentative STRICTE ---
+    strict_ok = check_geom((GEOM_Y_TOL, GEOM_X_TOL, GEOM_MIN_SPREAD))
+
+    # --- 2) tentative RELAX si strict échec ---
+    if not strict_ok and use_relaxed:
+        relaxed_ok = check_geom((RELAXED_GEOM_Y_TOL,
+                                 RELAXED_GEOM_X_TOL,
+                                 RELAXED_GEOM_MIN_SPREAD))
+        if not relaxed_ok:
+            return None
+    elif not strict_ok and not use_relaxed:
         return None
+    # sinon : strict OK
 
     # OK, on ordonne gauche/droite
     if b1[0] < b2[0]:
@@ -184,6 +213,7 @@ def order_calibration_points(calib_points):
         "bottom_left": bottom_left,
         "bottom_right": bottom_right,
     }
+
 
 
 # --------------------------------
@@ -592,4 +622,5 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
