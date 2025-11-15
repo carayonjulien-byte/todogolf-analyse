@@ -29,9 +29,9 @@ DEFAULT_RING_STEP_M = 5.0
 
 # Tolérances géométrie du triangle (en pixels)
 # -> ajuste selon ta taille d'impression et résolution typique des photos
-# GEOM_Y_TOL = 25      # Alignement vertical des 2 points du bas
-# GEOM_X_TOL = 60      # Centrage horizontal du point haut vs milieu de la base
-# GEOM_MIN_SPREAD = 40 # Écart vertical mini (base -> top)
+GEOM_Y_TOL = 25      # Alignement vertical des 2 points du bas
+GEOM_X_TOL = 60      # Centrage horizontal du point haut vs milieu de la base
+GEOM_MIN_SPREAD = 40 # Écart vertical mini (base -> top)
 RELAXED_GEOM_Y_TOL = 80     # tolérance Y plus large pour les 2 points du bas
 RELAXED_GEOM_X_TOL = 140    # tolérance X plus large pour le centrage du point haut
 RELAXED_GEOM_MIN_SPREAD = 15  # triangle plus "plat" accepté
@@ -622,5 +622,6 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
 
