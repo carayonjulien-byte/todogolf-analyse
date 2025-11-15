@@ -32,9 +32,9 @@ DEFAULT_RING_STEP_M = 5.0
 GEOM_Y_TOL = 25      # Alignement vertical des 2 points du bas
 GEOM_X_TOL = 60      # Centrage horizontal du point haut vs milieu de la base
 GEOM_MIN_SPREAD = 40 # Écart vertical mini (base -> top)
-RELAXED_GEOM_Y_TOL = 80     # tolérance Y plus large pour les 2 points du bas
-RELAXED_GEOM_X_TOL = 140    # tolérance X plus large pour le centrage du point haut
-RELAXED_GEOM_MIN_SPREAD = 15  # triangle plus "plat" accepté
+RELAXED_GEOM_Y_TOL = 120     # tolérance Y plus large pour les 2 points du bas
+RELAXED_GEOM_X_TOL = 180    # tolérance X plus large pour le centrage du point haut
+RELAXED_GEOM_MIN_SPREAD = 10  # triangle plus "plat" accepté
 
 
 # --------------------------------
@@ -140,8 +140,7 @@ def find_black_calibration_points(bgr_image):
         candidates.append((cx, cy, int(area)))
 
     candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
-    # On garde jusqu'à 8 gros candidats, ça laissera un peu de marge
-    return candidates[:8], thresh
+    return candidates[:3], thresh
 
 
 def order_calibration_points(calib_points, use_relaxed=True):
@@ -215,58 +214,6 @@ def order_calibration_points(calib_points, use_relaxed=True):
         "bottom_right": bottom_right,
     }
 
-def choose_best_calibration_triplet(calib_points, max_rel_error=0.22):
-    """
-    Choisit le meilleur triplet de repères en cherchant le cercle
-    qui colle le mieux aux points (en erreur relative).
-
-    calib_points : liste de (x, y, area)
-    max_rel_error : erreur relative max acceptée (0.22 = 22%)
-
-    Retourne :
-      - (cx, cy), r, (p1, p2, p3), reason
-      ou (None, None, None, "no-triplet") si rien d'acceptable.
-    """
-    if not calib_points or len(calib_points) < 3:
-        return None, None, None, "not-enough-points"
-
-    best = None
-    best_rel_err = None
-
-    # On teste toutes les combinaisons de 3 points parmi les candidats
-    for (p1, p2, p3) in itertools.combinations(calib_points, 3):
-        x1, y1, _ = p1
-        x2, y2, _ = p2
-        x3, y3, _ = p3
-
-        circle = circle_from_3_points((x1, y1), (x2, y2), (x3, y3))
-        if circle is None:
-            continue
-        cx, cy, r = circle
-        if r <= 0:
-            continue
-
-        # Erreur moyenne sur les 3 points
-        d1 = abs(math.dist((cx, cy), (x1, y1)) - r)
-        d2 = abs(math.dist((cx, cy), (x2, y2)) - r)
-        d3 = abs(math.dist((cx, cy), (x3, y3)) - r)
-        mean_err = (d1 + d2 + d3) / 3.0
-
-        rel_err = mean_err / float(r)  # erreur relative
-
-        if best is None or rel_err < best_rel_err:
-            best = ((cx, cy), r, (p1, p2, p3))
-            best_rel_err = rel_err
-
-    if best is None:
-        return None, None, None, "no-triplet"
-
-    if best_rel_err > max_rel_error:
-        # On a trouvé un cercle, mais trop "sale"
-        return None, None, None, f"rel-error-too-high({best_rel_err:.3f})"
-
-    (cx, cy), r, triplet = best
-    return (cx, cy), r, triplet, f"3points-rel({best_rel_err:.3f})"
 
 
 # --------------------------------
@@ -274,24 +221,20 @@ def choose_best_calibration_triplet(calib_points, max_rel_error=0.22):
 # --------------------------------
 def get_radar_center_and_radius_strict(img, calib_struct, calib_points):
     """
-    Version simplifiée & robuste :
-    - On ignore la géométrie top/bas trop stricte.
-    - On choisit le meilleur groupe de 3 points parmi les candidats
-      en fonction de la qualité du cercle (erreur relative).
+    Version stricte : pas de fallback.
+    Nécessite 3 repères et un triangle géométriquement valide.
     """
-    if not calib_points or len(calib_points) < 3:
-        return None, None, False, "not-enough-points"
-
-    center, r, triplet, reason = choose_best_calibration_triplet(
-        calib_points,
-        max_rel_error=0.22  # tu peux ajuster ici
-    )
-
-    if center is None or r is None:
-        return None, None, False, reason
-
-    return center, r, True, reason
-
+    if calib_struct is not None and calib_points and len(calib_points) == 3:
+        p1 = (calib_struct["top"][0],           calib_struct["top"][1])
+        p2 = (calib_struct["bottom_left"][0],   calib_struct["bottom_left"][1])
+        p3 = (calib_struct["bottom_right"][0],  calib_struct["bottom_right"][1])
+        circle = circle_from_3_points(p1, p2, p3)
+        if circle is not None:
+            cx, cy, r = circle
+            return (cx, cy), r, True, "3points-ok"
+        else:
+            return None, None, False, "invalid-triangle"
+    return None, None, False, "missing-or-invalid-points"
 
 
 # --------------------------------
@@ -679,7 +622,5 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
-
-
 
 
