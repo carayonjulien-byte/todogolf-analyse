@@ -85,11 +85,18 @@ def find_black_calibration_points(bgr_image):
     Détecte les 3 repères sombres (rond / carré / triangle),
     en ignorant les impacts rouges.
 
-    Version simplifiée & plus tolérante :
-    - on garde les blobs sombres non rouges avec area >= CALIB_MIN_AREA
-    - on exige une forme à peu près ronde OU triangle OU carré
-    - on retourne simplement les 3 plus gros candidats
+    Version plus ciblée :
+    - taille entre CALIB_MIN_AREA et CALIB_MAX_AREA
+    - pas rouge
+    - forme compacte (pas juste un trait / cercle très fin)
+    - ratio largeur/hauteur proche de 1
+    - suffisamment loin du centre de l'image (on évite le cœur du radar)
+    - on garde ensuite les 3 plus gros candidats
     """
+    h_img, w_img = bgr_image.shape[:2]
+    cx_img, cy_img = image_center(bgr_image)
+    diag = math.hypot(w_img, h_img)
+
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
@@ -113,41 +120,62 @@ def find_black_calibration_points(bgr_image):
         if area < CALIB_MIN_AREA or area > CALIB_MAX_AREA:
             continue
 
+        x, y, w, h = cv2.boundingRect(c)
+        if w == 0 or h == 0:
+            continue
+
+        # ratio largeur/hauteur proche de 1 (on évite les formes très allongées)
+        ratio = w / float(h)
+        if not (0.6 <= ratio <= 1.4):
+            continue
+
+        # compacité : on évite les contours trop "vides" (traits fins, grands cercles)
+        fill_ratio = area / float(w * h)
+        # un repère plein devrait être assez rempli
+        if fill_ratio < 0.4:
+            continue
+
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # Exclure le rouge (impacts)
-        h, s, v = hsv[cy, cx]
-        is_red = ((0 <= h <= 15 and s > 60 and v > 40) or (165 <= h <= 179 and s > 60 and v > 40))
+        # exclure le rouge (impacts)
+        h_col, s_col, v_col = hsv[cy, cx]
+        is_red = ((0 <= h_col <= 15 and s_col > 60 and v_col > 40) or
+                  (165 <= h_col <= 179 and s_col > 60 and v_col > 40))
         if is_red:
+            continue
+
+        # on veut des repères plutôt en périphérie du radar,
+        # pas au centre (évite de prendre le cœur du dessin).
+        dist_center = math.hypot(cx - cx_img, cy - cy_img)
+        if dist_center < 0.25 * diag:
+            # trop proche du centre → probablement pas un repère de coin
             continue
 
         per = cv2.arcLength(c, True)
         if per == 0:
             continue
 
-        # approx polygone (pour triangles/carrés)
         approx = cv2.approxPolyDP(c, 0.04 * per, True)
         sides = len(approx)
-
-        # circularité (pour blobs ronds)
         circularity = 4 * np.pi * (area / (per * per))
 
         # On accepte si :
-        # - assez rond, ou
+        # - assez rond (circularité élevée), ou
         # - triangle (3 côtés), ou
         # - carré (4 côtés)
-        if not (circularity >= 0.45 or sides in (3, 4)):
+        if not (circularity >= 0.55 or sides in (3, 4)):
             continue
 
         candidates.append((cx, cy, int(area)))
 
-    # On prend simplement les 3 plus gros repères
+    # On prend simplement les 3 plus gros repères parmi les candidats filtrés
     candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
     return candidates[:3], thresh
+
 
 
 def order_calibration_points(calib_points, use_relaxed=True):
@@ -537,3 +565,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
