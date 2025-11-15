@@ -21,8 +21,8 @@ CORS(
 # CONSTANTES
 # --------------------------------
 # Aire minimale / maximale des repères (en pixels² sur l'image redimensionnée)
-# On a volontairement assoupli le mini pour mieux capter le triangle du haut.
-CALIB_MIN_AREA = 80         # avant 300, plus tolérant
+# 3 mm → très petits en px, donc seuil mini assez bas
+CALIB_MIN_AREA = 40          # plus bas pour ne pas louper le triangle
 CALIB_MAX_AREA = 120000
 
 # Aire des impacts rouges (points) pour la détection des coups
@@ -31,6 +31,7 @@ MAX_RED_AREA_FALLBACK = 5000
 
 NB_RINGS = 4
 DEFAULT_RING_STEP_M = 5.0  # valeur par défaut si l'échelle n'est pas déduite
+
 
 # --------------------------------
 # OUTILS GÉOMÉTRIQUES
@@ -85,18 +86,17 @@ def find_black_calibration_points(bgr_image):
     Détecte les 3 repères sombres (rond / carré / triangle),
     en ignorant les impacts rouges.
 
-    Version plus ciblée :
-    - taille entre CALIB_MIN_AREA et CALIB_MAX_AREA
-    - pas rouge
-    - forme compacte (pas juste un trait / cercle très fin)
-    - ratio largeur/hauteur proche de 1
-    - suffisamment loin du centre de l'image (on évite le cœur du radar)
-    - on garde ensuite les 3 plus gros candidats
+    Stratégie :
+    - on récupère tous les blobs sombres non rouges
+    - on filtre par :
+        * aire dans [CALIB_MIN_AREA, CALIB_MAX_AREA]
+        * forme compacte (pas un trait, pas un anneau vide)
+        * ratio largeur/hauteur ~ 1
+    - on trie par aire
+    - on garde uniquement ceux qui ont une aire proche de la plus grande
+      (repères imprimés identiques → tailles proches)
+    - puis on retourne les 3 plus gros parmi ce groupe
     """
-    h_img, w_img = bgr_image.shape[:2]
-    cx_img, cy_img = image_center(bgr_image)
-    diag = math.hypot(w_img, h_img)
-
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
@@ -114,7 +114,7 @@ def find_black_calibration_points(bgr_image):
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
-    candidates = []
+    raw_candidates = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < CALIB_MIN_AREA or area > CALIB_MAX_AREA:
@@ -124,15 +124,14 @@ def find_black_calibration_points(bgr_image):
         if w == 0 or h == 0:
             continue
 
-        # ratio largeur/hauteur proche de 1 (on évite les formes très allongées)
+        # ratio largeur/hauteur proche de 1 → on évite les formes très allongées
         ratio = w / float(h)
         if not (0.6 <= ratio <= 1.4):
             continue
 
-        # compacité : on évite les contours trop "vides" (traits fins, grands cercles)
+        # compacité : on évite les contours trop "vides" (traits fins, grands arcs)
         fill_ratio = area / float(w * h)
-        # un repère plein devrait être assez rempli
-        if fill_ratio < 0.4:
+        if fill_ratio < 0.35:
             continue
 
         M = cv2.moments(c)
@@ -148,13 +147,6 @@ def find_black_calibration_points(bgr_image):
         if is_red:
             continue
 
-        # on veut des repères plutôt en périphérie du radar,
-        # pas au centre (évite de prendre le cœur du dessin).
-        dist_center = math.hypot(cx - cx_img, cy - cy_img)
-        if dist_center < 0.25 * diag:
-            # trop proche du centre → probablement pas un repère de coin
-            continue
-
         per = cv2.arcLength(c, True)
         if per == 0:
             continue
@@ -167,15 +159,36 @@ def find_black_calibration_points(bgr_image):
         # - assez rond (circularité élevée), ou
         # - triangle (3 côtés), ou
         # - carré (4 côtés)
-        if not (circularity >= 0.55 or sides in (3, 4)):
+        if not (circularity >= 0.45 or sides in (3, 4)):
             continue
 
-        candidates.append((cx, cy, int(area)))
+        raw_candidates.append((cx, cy, int(area), w, h))
 
-    # On prend simplement les 3 plus gros repères parmi les candidats filtrés
-    candidates = sorted(candidates, key=lambda p: p[2], reverse=True)
-    return candidates[:3], thresh
+    if len(raw_candidates) == 0:
+        return [], thresh
 
+    # tri par aire décroissante
+    raw_candidates.sort(key=lambda p: p[2], reverse=True)
+
+    # on part de la plus grande aire comme référence
+    base_area = float(raw_candidates[0][2])
+
+    # on garde uniquement les formes dont l'aire est "proche" de la plus grande
+    # → ex : entre 40% et 250% de la plus grande
+    filtered = [
+        (cx, cy, area)
+        for (cx, cy, area, w, h) in raw_candidates
+        if (area >= base_area * 0.4 and area <= base_area * 2.5)
+    ]
+
+    # si après ce filtrage il reste moins de 3 points, on reprend les bruts
+    candidates = filtered if len(filtered) >= 3 else [
+        (cx, cy, area) for (cx, cy, area, w, h) in raw_candidates
+    ]
+
+    # on garde les 3 plus gros
+    candidates = sorted(candidates, key=lambda p: p[2], reverse=True)[:3]
+    return candidates, thresh
 
 
 def order_calibration_points(calib_points, use_relaxed=True):
@@ -185,9 +198,6 @@ def order_calibration_points(calib_points, use_relaxed=True):
     - on trie par Y
     - le plus haut = top
     - les deux autres = bottom_left / bottom_right (par X)
-
-    On ne fait plus de géométrie stricte, on considère que les 3 gros repères sombres
-    sont les bons repères du radar.
     """
     if not calib_points or len(calib_points) < 3:
         return None
@@ -304,10 +314,12 @@ def find_red_points(bgr_image,
                     min_area=MIN_RED_AREA_FALLBACK,
                     max_area=MAX_RED_AREA_FALLBACK):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+
     lower_red_1 = np.array([0, 70, 50])
     upper_red_1 = np.array([15, 255, 255])
     lower_red_2 = np.array([165, 70, 50])
     upper_red_2 = np.array([179, 255, 255])
+
     mask1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
     mask2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
     mask = cv2.bitwise_or(mask1, mask2)
@@ -339,7 +351,7 @@ def find_red_points(bgr_image,
 # --------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Radar ToDoGolf API – repères simplifiés, triangle plus tolérant", 200
+    return "Radar ToDoGolf API – repères 3mm, détection tolérante + filtre d’aire similaire", 200
 
 
 @app.route("/analyze", methods=["POST"])
@@ -565,4 +577,3 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
-
