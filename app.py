@@ -178,59 +178,97 @@ def find_black_calibration_points(bgr_image):
     return candidates, thresh
 
 
+from itertools import combinations  # Assure-toi d'avoir cette ligne en haut du fichier
+
+def _score_triangle_with_tolerances(top, b1, b2):
+    """
+    Évalue si (top, b1, b2) forme un triangle acceptable.
+    Renvoie (score, reason).
+    Les tolérances sont partiellement dynamiques, basées sur la longueur de la base.
+    """
+    # longueur horizontale de la base
+    base_len = abs(b1[0] - b2[0])
+    if base_len < 10:
+        return None, "base-too-small"
+
+    # alignement vertical des 2 points du bas
+    dy_bottom = abs(b1[1] - b2[1])
+    base_y = (b1[1] + b2[1]) / 2.0
+    spread = base_y - top[1]  # distance verticale entre la base et le sommet
+
+    x_mid_base = (b1[0] + b2[0]) / 2.0
+    dx_top_mid = abs(top[0] - x_mid_base)
+
+    # --- 🔧 TOLÉRANCES ASSOUPLIES ---
+    y_tol_dyn = max(GEOM_Y_TOL, 0.25 * base_len)          # bas alignés
+    x_tol_dyn = max(GEOM_X_TOL, 0.60 * base_len)          # haut centré
+    min_spread_dyn = max(GEOM_MIN_SPREAD, 0.10 * base_len)  # hauteur min
+
+    if dy_bottom > y_tol_dyn:
+        return None, "bottom-misaligned"
+
+    if spread < min_spread_dyn:
+        return None, "top-not-high-enough"
+
+    if dx_top_mid > x_tol_dyn:
+        return None, "top-not-centered"
+
+    # score = triangle bien ouvert (large + haut)
+    score = base_len * spread
+    return score, "ok"
+
+
 def order_calibration_points(calib_points):
     """
-    Ordonne les 3 repères en (top, bottom_left, bottom_right) SI la géométrie "triangle isocèle"
-    est plausible :
-      - deux points du bas quasi alignés (|y1 - y2| <= GEOM_Y_TOL)
-      - point du haut au-dessus d'un minimum (GEOM_MIN_SPREAD)
-      - point du haut proche du milieu de la base (|x_top - x_mid_base| <= GEOM_X_TOL)
-    Sinon, retourne (None, reason).
+    Cherche le meilleur triangle parmi les repères détectés.
+    - On garde jusqu'à 6 repères
+    - On teste toutes les combinaisons de 3
+    - On choisit le triangle valide avec le meilleur score
+
+    Retourne (structure, reason)
     """
     if not calib_points or len(calib_points) < 3:
         log_debug("[order_calibration_points] not enough calib points")
         return None, "not-enough-calib-points"
 
-    # on garde les 3 plus gros
-    pts = sorted(calib_points, key=lambda p: p[2], reverse=True)[:3]
-    # tri par Y croissant : top en premier
-    pts_y = sorted(pts, key=lambda p: p[1])
-    top = pts_y[0]
-    b1, b2 = pts_y[1], pts_y[2]
+    pts = sorted(calib_points, key=lambda p: p[2], reverse=True)[:6]
 
-    # 1) deux points du bas quasi alignés
-    if abs(b1[1] - b2[1]) > GEOM_Y_TOL:
-        dy = abs(b1[1] - b2[1])
-        log_debug(f"[order_calibration_points] bottom misaligned: dy={dy} > {GEOM_Y_TOL}")
-        return None, "bottom-misaligned"
+    best_struct = None
+    best_score = -1
+    last_reason = "no-valid-triangle"
 
-    # 2) le point du haut suffisamment au-dessus
-    base_y = (b1[1] + b2[1]) / 2.0
-    spread = base_y - top[1]
-    if spread < GEOM_MIN_SPREAD:
-        log_debug(f"[order_calibration_points] top not high enough: "
-                  f"spread={spread} < {GEOM_MIN_SPREAD}")
-        return None, "top-not-high-enough"
+    for triplet in combinations(pts, 3):
+        pA, pB, pC = triplet
 
-    # 3) le point du haut proche du milieu horizontal de la base
-    x_mid_base = (b1[0] + b2[0]) / 2.0
-    dx = abs(top[0] - x_mid_base)
-    if dx > GEOM_X_TOL:
-        log_debug(f"[order_calibration_points] top not centered: dx={dx} > {GEOM_X_TOL}")
-        return None, "top-not-centered"
+        # tri par Y : top = plus haut
+        pts_y = sorted(triplet, key=lambda p: p[1])
+        top = pts_y[0]
+        b1, b2 = pts_y[1], pts_y[2]
 
-    # OK, on ordonne gauche/droite
-    if b1[0] < b2[0]:
-        bottom_left, bottom_right = b1, b2
-    else:
-        bottom_left, bottom_right = b2, b1
+        score, reason = _score_triangle_with_tolerances(top, b1, b2)
 
-    log_debug("[order_calibration_points] triangle accepted")
-    return {
-        "top": top,
-        "bottom_left": bottom_left,
-        "bottom_right": bottom_right,
-    }, "ok"
+        if score is None:
+            last_reason = reason
+            continue
+
+        if score > best_score:
+            best_score = score
+            # gauche/droite
+            bottom_left, bottom_right = (b1, b2) if b1[0] < b2[0] else (b2, b1)
+
+            best_struct = {
+                "top": top,
+                "bottom_left": bottom_left,
+                "bottom_right": bottom_right
+            }
+
+    if best_struct is None:
+        log_debug(f"[order_calibration_points] no valid triangle found, last_reason={last_reason}")
+        return None, last_reason
+
+    log_debug(f"[order_calibration_points] triangle accepted with score={best_score}")
+    return best_struct, "ok"
+
 
 
 # --------------------------------
@@ -557,4 +595,5 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
