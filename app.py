@@ -393,16 +393,35 @@ def analyze():
         calib_struct,
         calib_points
     )
-    if radar_center is None or outer_radius_px is None:
-        return jsonify({
-            "error": "circle-fit-failed",
-            "message": "Impossible de calculer le centre du radar à partir des repères.",
-            "reason": circle_reason,
-            "debug": {
-                "nb_points_calib": len(calib_points) if calib_points else 0,
-                "calib_points": calib_points
-            }
-        }), 400
+if radar_center is None or outer_radius_px is None:
+    nb_calib = len(calib_points) if calib_points else 0
+
+    # Détermination du message à donner à l'utilisateur
+    if nb_calib < 3:
+        # 👉 Problème typique : lumière / reflet / contraste
+        tips = (
+            "Moins de trois repères détectés. "
+            "Essayez de reprendre la photo sans lumière directe, reflets ou flash. "
+            "Utilisez une lumière diffuse."
+        )
+    else:
+        # 👉 Trois repères détectés mais triangle KO → orientation
+        tips = (
+            "Les trois repères sont détectés mais leur alignement n'est pas correct. "
+            "Assurez-vous que les deux repères du bas sont bien lignés en bas de la photo "
+            "et que le repère du haut est au-dessus, avec la feuille à peu près droite."
+        )
+
+    return jsonify({
+        "error": "calibration-failed",
+        "reason": circle_reason,
+        "debug": {
+            "nb_points_calib": nb_calib,
+            "calib_points": calib_points,
+            "circle_reason": circle_reason
+        },
+        "tips": tips
+    }), 400
 
     # 3) aire attendue pour les points rouges en fonction des repères
     min_red_area, max_red_area = compute_red_area_bounds_from_calib(calib_points)
@@ -595,5 +614,6 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
 
 
