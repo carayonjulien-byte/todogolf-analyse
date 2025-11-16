@@ -20,7 +20,7 @@ CORS(
 # --------------------------------
 # CONSTANTES
 # --------------------------------
-CALIB_MIN_AREA = 300        # tolérance repères imprimés (aire min/max en px)
+CALIB_MIN_AREA = 150        # tolérance repères imprimés (aire min/max en px)
 CALIB_MAX_AREA = 120000
 
 # aire par défaut pour les impacts rouges (fallback global)
@@ -117,7 +117,7 @@ def find_black_calibration_points(bgr_image):
     On ne garde que des formes suffisamment rondes.
 
     Retourne:
-      - une liste de max 3 points: [(cx, cy, area_px), ...]
+      - une liste de max 6 points: [(cx, cy, area_px), ...]
       - l'image binaire de travail (thresh), pour debug éventuel.
     """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
@@ -163,14 +163,16 @@ def find_black_calibration_points(bgr_image):
 
         # circularité (1.0 = cercle parfait)
         circularity = 4 * np.pi * (area / (per * per))
-        if circularity < 0.6:
+        # ⚠ assouplie : 0.5 au lieu de 0.6
+        if circularity < 0.5:
             # pas assez rond -> on rejette
             continue
 
         candidates.append((cx, cy, int(area)))
 
-    # on garde les 3 plus gros ronds
-    candidates = sorted(candidates, key=lambda p: p[2], reverse=True)[:3]
+    # on garde les 6 plus gros ronds max,
+    # la géométrie choisira ensuite le meilleur triangle
+    candidates = sorted(candidates, key=lambda p: p[2], reverse=True)[:6]
     log_debug(f"[find_black_calibration_points] found={len(candidates)} candidates")
 
     return candidates, thresh
@@ -555,3 +557,4 @@ def test_mask_page():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
